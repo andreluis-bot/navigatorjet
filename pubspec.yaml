@@ -1,0 +1,94 @@
+name: navigatorjet
+description: Instrumento digital de navegação para Jet Ski e embarcações leves
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ============================================
+  # NÚCLEO DE NAVEGAÇÃO (CAMADA 1)
+  # ============================================
+  
+  # Sensores
+  sensors_plus: ^5.0.1              # Acelerômetro, giroscópio, magnetômetro
+  flutter_compass: ^0.8.0           # Bússola magnética
+  geolocator: ^13.0.2               # GPS
+  
+  # Cálculos geoespaciais
+  latlong2: ^0.9.1                  # Lat/lng, bearing, distância
+  
+  # Gerenciamento de bateria e sistema
+  battery_plus: ^6.0.2              # Nível de bateria + eventos
+  wakelock_plus: ^1.2.8             # Manter tela ligada
+  
+  # ============================================
+  # PERSISTÊNCIA (V1)
+  # ============================================
+  
+  # NoSQL (trilhas, waypoints)
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  
+  # Arquivos
+  path_provider: ^2.1.4             # Diretórios do app
+  file_picker: ^8.1.4               # Import GPX externos
+  
+  # ============================================
+  # MAPAS (CAMADA 5)
+  # ============================================
+  
+  # Mapa base
+  flutter_map: ^7.0.2
+  google_maps_flutter: ^2.10.0      # Adicionado para UI Tática V2
+  
+  # ============================================
+  # GPX/KML
+  # ============================================
+  
+  gpx: ^2.2.2                       # Parser GPX
+  
+  # ============================================
+  # UI E STATE
+  # ============================================
+  
+  flutter_riverpod: ^2.6.1
+  riverpod_annotation: ^2.6.1
+  
+  # Navegação
+  go_router: ^14.6.2
+  
+  # Permissões
+  permission_handler: ^11.3.1
+  
+  # ============================================
+  # UTILS
+  # ============================================
+  
+  uuid: ^4.5.1                      # IDs únicos
+  intl: ^0.19.0                     # Formatação i18n
+  logger: ^2.4.0                    # Logs
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+
+  build_runner: ^2.4.13
+  hive_generator: ^2.0.1
+  # riverpod_generator: ^2.6.2
+  riverpod_generator: ^2.4.0
+
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/icons/
+    - assets/sounds/
+    - assets/images/
