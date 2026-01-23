@@ -1,0 +1,1629 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:go_router/go_router.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:logger/logger.dart';
+
+import '../../../../core/config/app_config.dart';
+import '../../../../data/models/route.dart' as app_route;
+import '../../../../data/services/compass_service.dart';
+import '../../../../data/services/gps_service.dart';
+import '../../../gpx/import/gpx_parser.dart';
+import '../../../navigation/logic/navigation_engine.dart';
+
+// ============================================
+// DESIGN SYSTEM - 3 TEMAS DISPONÍVEIS
+// ============================================
+
+enum UITheme { tactical, aviation, maritime }
+
+class ThemeConfig {
+  final Color primary;
+  final Color secondary;
+  final Color danger;
+  final Color warning;
+  final Color glass;
+  final Color mapBg;
+  final String name;
+
+  const ThemeConfig({
+    required this.primary,
+    required this.secondary,
+    required this.danger,
+    required this.warning,
+    required this.glass,
+    required this.mapBg,
+    required this.name,
+  });
+
+  static const tactical = ThemeConfig(
+    primary: Color(0xFF00FF41),
+    secondary: Color(0xFF00E5FF),
+    danger: Color(0xFFFF2B2B),
+    warning: Color(0xFFFF9100),
+    glass: Color(0xCC111111),
+    mapBg: Color(0xFF000000),
+    name: "TÁTICO",
+  );
+
+  static const aviation = ThemeConfig(
+    primary: Color(0xFF00D9FF),
+    secondary: Color(0xFFFFD700),
+    danger: Color(0xFFFF3838),
+    warning: Color(0xFFFFA500),
+    glass: Color(0xCC1A1A2E),
+    mapBg: Color(0xFF0F0F23),
+    name: "AVIAÇÃO",
+  );
+
+  static const maritime = ThemeConfig(
+    primary: Color(0xFF00C4FF),
+    secondary: Color(0xFFFFFFFF),
+    danger: Color(0xFFFF4757),
+    warning: Color(0xFFFFA502),
+    glass: Color(0xCC0A3D62),
+    mapBg: Color(0xFF0C2D48),
+    name: "MARÍTIMO",
+  );
+
+  static ThemeConfig fromEnum(UITheme theme) {
+    switch (theme) {
+      case UITheme.tactical:
+        return tactical;
+      case UITheme.aviation:
+        return aviation;
+      case UITheme.maritime:
+        return maritime;
+    }
+  }
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum MapStyle { dark, satellite, light, terrain }
+enum NavigationMode { northUp, courseUp }
+enum AnchorAlarmStatus { inactive, active, dragging }
+
+// ============================================
+// MAIN SCREEN
+// ============================================
+
+class MapScreen extends ConsumerStatefulWidget {
+  const MapScreen({super.key});
+
+  @override
+  ConsumerState<MapScreen> createState() => _MapScreenState();
+}
+
+class _MapScreenState extends ConsumerState<MapScreen> with TickerProviderStateMixin {
+  final MapController _mapController = MapController();
+  final GPXParser _gpxParser = GPXParser();
+  final Logger _logger = Logger();
+
+  // ============================================
+  // ESTADO LOCAL
+  // ============================================
+  
+  double _smoothHeading = 0.0;
+  double _smoothSpeed = 0.0;
+  MapStyle _currentMapStyle = MapStyle.dark;
+  NavigationMode _navMode = NavigationMode.courseUp;
+  UITheme _currentTheme = UITheme.tactical;
+  
+  bool _showWeatherLayer = false;
+  bool _showWindLayer = false;
+  bool _isCalibrationNeeded = false;
+  
+  // Ancoragem
+  AnchorAlarmStatus _anchorStatus = AnchorAlarmStatus.inactive;
+  LatLng? _anchorPoint;
+  double _anchorRadius = 50.0; // metros
+  
+  // Segmento selecionado
+  LatLng? _selectedSegmentPoint;
+  String? _segmentLabelForward;
+  String? _segmentLabelReverse;
+  
+  // Perigos marcados
+  List<LatLng> _dangerMarkers = [];
+  
+  // Timer para bateria/FPS adaptativo
+  Timer? _batteryCheckTimer;
+  int _batteryLevel = 100;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _initializeSensors();
+      _startBatteryMonitoring();
+      _checkCompassCalibration();
+    });
+  }
+
+  @override
+  void dispose() {
+    _batteryCheckTimer?.cancel();
+    super.dispose();
+  }
+
+  // ============================================
+  // INICIALIZAÇÃO
+  // ============================================
+
+  Future<void> _initializeSensors() async {
+    // Inicia GPS imediatamente
+    ref.read(currentPositionProvider);
+    
+    // Inicia bússola
+    ref.read(currentHeadingProvider);
+    
+    // Solicita permissão de localização
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    if (permission == LocationPermission.whileInUse || 
+        permission == LocationPermission.always) {
+      try {
+        await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.high
+        );
+      } catch (e) {
+        _logger.e("GPS Error: $e");
+      }
+    }
+  }
+
+  void _startBatteryMonitoring() {
+    _batteryCheckTimer = Timer.periodic(const Duration(minutes: 1), (_) async {
+      // Simulação - em produção usar battery_plus
+      if (mounted) {
+        setState(() {
+          _batteryLevel = math.max(5, _batteryLevel - 1);
+        });
+      }
+    });
+  }
+
+  Future<void> _checkCompassCalibration() async {
+    // Simula verificação de calibração
+    await Future.delayed(const Duration(seconds: 2));
+    
+    // Se heading não está variando ou tem interferência, pede calibração
+    final heading = ref.read(currentHeadingProvider).value;
+    if (heading == null || heading == 0.0) {
+      setState(() => _isCalibrationNeeded = true);
+      _showCalibrationDialog();
+    }
+  }
+
+  // ============================================
+  // BUILD PRINCIPAL
+  // ============================================
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = ThemeConfig.fromEnum(_currentTheme);
+    final compassAsync = ref.watch(currentHeadingProvider);
+    final gpsAsync = ref.watch(currentPositionProvider);
+    final navigationState = ref.watch(navigationEngineProvider);
+
+    // Suavização de valores
+    final double rawHeading = compassAsync.value ?? _smoothHeading;
+    final double rawSpeed = (gpsAsync.value?.speed ?? 0.0) * 3.6;
+
+    _smoothHeading = _lerpHeading(_smoothHeading, rawHeading, 0.15);
+    _smoothSpeed = _lerpDouble(_smoothSpeed, rawSpeed, 0.1);
+
+    final LatLng currentPos = gpsAsync.value != null
+        ? LatLng(gpsAsync.value!.latitude, gpsAsync.value!.longitude)
+        : const LatLng(-23.5505, -46.6333);
+
+    // Rotação do mapa
+    final double mapRotation = _navMode == NavigationMode.courseUp 
+        ? -_smoothHeading 
+        : 0.0;
+
+    // Verifica arrastar de âncora
+    if (_anchorStatus == AnchorAlarmStatus.active) {
+      _checkAnchorDrag(currentPos);
+    }
+
+    return Scaffold(
+      backgroundColor: theme.mapBg,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // 1. MAPA BASE
+          _buildFlutterMap(currentPos, navigationState, mapRotation, theme),
+
+          // 2. VIGNETTE (se tema escuro)
+          if (_currentMapStyle != MapStyle.light) 
+            _buildVignetteOverlay(),
+
+          // 3. HUD SUPERIOR - BÚSSOLA
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              bottom: false,
+              child: _buildCompassHUD(_smoothHeading, theme),
+            ),
+          ),
+
+          // 4. PAINEL INFERIOR - DASHBOARD
+          Positioned(
+            bottom: 30,
+            left: 16,
+            right: 16,
+            child: SafeArea(
+              top: false,
+              child: _buildDashboard(_smoothSpeed, navigationState, gpsAsync, theme),
+            ),
+          ),
+
+          // 5. CONTROLES LATERAIS ESQUERDOS
+          Positioned(
+            left: 16,
+            top: MediaQuery.of(context).padding.top + 120,
+            child: _buildLeftControls(theme),
+          ),
+
+          // 6. CONTROLES LATERAIS DIREITOS
+          Positioned(
+            right: 16,
+            bottom: 180,
+            child: _buildRightControls(currentPos, theme),
+          ),
+
+          // 7. STATUS SUPERIORES
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 10,
+            left: 16,
+            child: _buildGpsStatus(gpsAsync, theme),
+          ),
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 10,
+            right: 16,
+            child: _buildBatteryStatus(_batteryLevel, theme),
+          ),
+
+          // 8. ALERTA DE ANCORAGEM (se ativo)
+          if (_anchorStatus == AnchorAlarmStatus.dragging)
+            _buildAnchorDragAlert(theme),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: MAPA
+  // ============================================
+
+  Widget _buildFlutterMap(
+    LatLng center,
+    NavigationData navState,
+    double rotation,
+    ThemeConfig theme,
+  ) {
+    String urlTemplate;
+    List<String> subdomains = const ['a', 'b', 'c', 'd'];
+
+    switch (_currentMapStyle) {
+      case MapStyle.satellite:
+        urlTemplate = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+        subdomains = const [];
+        break;
+      case MapStyle.terrain:
+        urlTemplate = 'https://mt0.google.com/vt/lyrs=p&x={x}&y={y}&z={z}';
+        subdomains = const [];
+        break;
+      case MapStyle.light:
+        urlTemplate = 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+        break;
+      case MapStyle.dark:
+      default:
+        urlTemplate = 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+        break;
+    }
+
+    return FlutterMap(
+      mapController: _mapController,
+      options: MapOptions(
+        initialCenter: center,
+        initialZoom: 16.0,
+        initialRotation: rotation,
+        backgroundColor: theme.mapBg,
+        onTap: (tapPos, point) => _handleMapTap(point, navState),
+        interactionOptions: InteractionOptions(
+          flags: _navMode == NavigationMode.courseUp
+              ? InteractiveFlag.all & ~InteractiveFlag.rotate
+              : InteractiveFlag.all,
+        ),
+      ),
+      children: [
+        // Tiles base
+        TileLayer(
+          urlTemplate: urlTemplate,
+          subdomains: subdomains,
+          userAgentPackageName: 'com.navigatorjet.app',
+          retinaMode: true,
+        ),
+
+        // Camada de Clima (se ativa)
+        if (_showWeatherLayer)
+          TileLayer(
+            urlTemplate: 'https://tile.openweathermap.org/map/clouds_new/{z}/{x}/{y}.png?appid=YOUR_API_KEY',
+            opacity: 0.5,
+          ),
+
+        // Círculo de âncora
+        if (_anchorPoint != null)
+          CircleLayer(
+            circles: [
+              CircleMarker(
+                point: _anchorPoint!,
+                radius: _anchorRadius,
+                color: _anchorStatus == AnchorAlarmStatus.dragging
+                    ? theme.danger.withOpacity(0.3)
+                    : theme.primary.withOpacity(0.2),
+                borderColor: _anchorStatus == AnchorAlarmStatus.dragging
+                    ? theme.danger
+                    : theme.primary,
+                borderStrokeWidth: 2,
+              ),
+            ],
+          ),
+
+        // Rota ativa
+        if (navState.activeRoute != null)
+          PolylineLayer(
+            polylines: [
+              Polyline(
+                points: navState.activeRoute!.points
+                    .map((p) => LatLng(p.latitude, p.longitude))
+                    .toList(),
+                strokeWidth: 5.0,
+                color: theme.secondary,
+                pattern: const StrokePattern.dotted(),
+              ),
+            ],
+          ),
+
+        // Marcadores de perigo
+        MarkerLayer(
+          markers: _dangerMarkers
+              .map((point) => Marker(
+                    point: point,
+                    width: 40,
+                    height: 40,
+                    child: Icon(
+                      Icons.warning,
+                      color: theme.danger,
+                      size: 30,
+                    ),
+                  ))
+              .toList(),
+        ),
+
+        // Etiqueta de segmento
+        if (_selectedSegmentPoint != null)
+          MarkerLayer(
+            markers: [
+              Marker(
+                point: _selectedSegmentPoint!,
+                width: 200,
+                height: 90,
+                child: _buildSegmentLabel(theme),
+                alignment: Alignment.topCenter,
+              ),
+            ],
+          ),
+
+        // Âncora (se ativa)
+        if (_anchorPoint != null)
+          MarkerLayer(
+            markers: [
+              Marker(
+                point: _anchorPoint!,
+                width: 30,
+                height: 30,
+                child: Icon(Icons.anchor, color: theme.primary, size: 24),
+              ),
+            ],
+          ),
+
+        // Marcador de posição
+        MarkerLayer(
+          markers: [
+            Marker(
+              point: center,
+              width: 80,
+              height: 80,
+              child: _buildNavigationMarker(theme),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: MARCADOR DE NAVEGAÇÃO
+  // ============================================
+
+  Widget _buildNavigationMarker(ThemeConfig theme) {
+    double iconRotation = _navMode == NavigationMode.courseUp
+        ? 0.0
+        : (_smoothHeading * (math.pi / 180));
+
+    return Transform.rotate(
+      angle: iconRotation,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Container(
+            width: 20,
+            height: 20,
+            decoration: BoxDecoration(
+              color: theme.primary.withOpacity(0.3),
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: theme.primary,
+                  blurRadius: 10,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+          ),
+          Icon(
+            Icons.navigation,
+            color: theme.primary,
+            size: 48,
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: HUD BÚSSOLA
+  // ============================================
+
+  Widget _buildCompassHUD(double heading, ThemeConfig theme) {
+    return Container(
+      height: 90,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [
+            theme.glass.withOpacity(0.9),
+            Colors.transparent,
+          ],
+        ),
+      ),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          Text(
+            "${heading.toStringAsFixed(0)}°",
+            style: TextStyle(
+              color: theme.primary,
+              fontSize: 28,
+              fontWeight: FontWeight.w900,
+              fontFamily: 'monospace',
+              shadows: [Shadow(color: theme.primary, blurRadius: 8)],
+            ),
+          ),
+          Expanded(
+            child: Stack(
+              alignment: Alignment.bottomCenter,
+              children: [
+                CustomPaint(
+                  painter: CompassRosePainter(
+                    heading: heading,
+                    theme: theme,
+                  ),
+                  size: const Size(double.infinity, 40),
+                ),
+                Icon(Icons.arrow_drop_up, color: theme.danger, size: 30),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: DASHBOARD
+  // ============================================
+
+  Widget _buildDashboard(
+    double speed,
+    NavigationData navState,
+    AsyncValue gpsAsync,
+    ThemeConfig theme,
+  ) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+            color: theme.glass,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.white24, width: 0.5),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              // VELOCIDADE
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    "VELOCIDADE",
+                    style: TextStyle(color: Colors.grey[400], fontSize: 10),
+                  ),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
+                    children: [
+                      Text(
+                        speed.toStringAsFixed(0),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 44,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        " km/h",
+                        style: TextStyle(color: theme.primary, fontSize: 14),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+
+              Container(width: 1, height: 40, color: Colors.white12),
+
+              // MÉTRICAS
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildInfoRow(
+                    "RUMO",
+                    "${gpsAsync.value?.heading?.toStringAsFixed(0) ?? '000'}°",
+                    theme,
+                  ),
+                  const SizedBox(height: 4),
+                  _buildInfoRow(
+                    "DIST",
+                    navState.distanceToTarget != null
+                        ? "${(navState.distanceToTarget! / 1000).toStringAsFixed(1)}km"
+                        : "--",
+                    theme,
+                  ),
+                ],
+              ),
+
+              // BOTÃO DE ANCORAGEM
+              InkWell(
+                onTap: _toggleAnchorAlarm,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: _anchorStatus == AnchorAlarmStatus.active
+                        ? theme.primary.withOpacity(0.2)
+                        : theme.glass,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: _anchorStatus == AnchorAlarmStatus.active
+                          ? theme.primary
+                          : Colors.white24,
+                    ),
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        Icons.anchor,
+                        color: _anchorStatus == AnchorAlarmStatus.active
+                            ? theme.primary
+                            : Colors.white,
+                        size: 20,
+                      ),
+                      Text(
+                        "ÂNCORA",
+                        style: TextStyle(
+                          color: _anchorStatus == AnchorAlarmStatus.active
+                              ? theme.primary
+                              : Colors.white,
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value, ThemeConfig theme) {
+    return Row(
+      children: [
+        Text(
+          "$label ",
+          style: TextStyle(color: Colors.grey[400], fontSize: 10),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: theme.secondary,
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: CONTROLES LATERAIS
+  // ============================================
+
+  Widget _buildLeftControls(ThemeConfig theme) {
+    return Column(
+      children: [
+        _buildCircleButton(
+          Icons.layers,
+          () => _showMapStyleSelector(context, theme),
+          theme,
+        ),
+        const SizedBox(height: 12),
+        _buildCircleButton(Icons.folder_open, _handleGpxImport, theme),
+        const SizedBox(height: 12),
+        _buildCircleButton(
+          Icons.palette,
+          () => _showThemeSelector(context, theme),
+          theme,
+        ),
+        const SizedBox(height: 12),
+        _buildCircleButton(
+          Icons.warning,
+          _addDangerMarker,
+          theme,
+          active: false,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildRightControls(LatLng currentPos, ThemeConfig theme) {
+    return Column(
+      children: [
+        _buildMiniButton(Icons.add, () {
+          final currZoom = _mapController.camera.zoom;
+          _mapController.move(_mapController.camera.center, currZoom + 1);
+        }, theme),
+        const SizedBox(height: 8),
+        _buildMiniButton(Icons.remove, () {
+          final currZoom = _mapController.camera.zoom;
+          _mapController.move(_mapController.camera.center, currZoom - 1);
+        }, theme),
+        const SizedBox(height: 20),
+        _buildCircleButton(Icons.my_location, () {
+          ref.refresh(currentPositionProvider);
+          _mapController.move(currentPos, 16);
+        }, theme),
+        const SizedBox(height: 12),
+        _buildCircleButton(
+          _navMode == NavigationMode.northUp ? Icons.explore : Icons.navigation,
+          _toggleNavigationMode,
+          theme,
+          active: _navMode == NavigationMode.courseUp,
+        ),
+        const SizedBox(height: 12),
+        _buildCircleButton(
+          _showWeatherLayer ? Icons.cloud : Icons.cloud_outlined,
+          () => setState(() => _showWeatherLayer = !_showWeatherLayer),
+          theme,
+          active: _showWeatherLayer,
+        ),
+      ],
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: BOTÕES
+  // ============================================
+
+  Widget _buildCircleButton(
+    IconData icon,
+    VoidCallback onTap,
+    ThemeConfig theme, {
+    bool active = false,
+  }) {
+    return Container(
+      width: 44,
+      height: 44,
+      decoration: BoxDecoration(
+        color: active ? theme.primary : theme.glass,
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: active ? theme.primary : Colors.white24,
+        ),
+      ),
+      child: IconButton(
+        icon: Icon(
+          icon,
+          color: active ? Colors.black : Colors.white,
+          size: 20,
+        ),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  Widget _buildMiniButton(IconData icon, VoidCallback onTap, ThemeConfig theme) {
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        color: theme.glass.withOpacity(0.6),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        icon: Icon(icon, color: Colors.white, size: 18),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: STATUS GPS
+  // ============================================
+
+  Widget _buildGpsStatus(AsyncValue gpsAsync, ThemeConfig theme) {
+    double accuracy = 999;
+    if (gpsAsync.hasValue && gpsAsync.value != null) {
+      accuracy = gpsAsync.value!.accuracy;
+    }
+
+    Color signalColor;
+    String label;
+    int bars;
+
+    if (!gpsAsync.hasValue || gpsAsync.value == null) {
+      signalColor = theme.danger;
+      label = "N/A";
+      bars = 0;
+    } else if (accuracy <= 5) {
+      signalColor = theme.primary;
+      label = "GPS 3D";
+      bars = 4;
+    } else if (accuracy <= 10) {
+      signalColor = theme.primary;
+      label = "READY";
+      bars = 3;
+    } else if (accuracy <= 20) {
+      signalColor = theme.warning;
+      label = "WEAK";
+      bars = 2;
+    } else {
+      signalColor = theme.danger;
+      label = "POOR";
+      bars = 1;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.8),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: signalColor.withOpacity(0.5)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: List.generate(
+              4,
+              (index) => Container(
+                width: 3,
+                height: 6.0 + (index * 3),
+                margin: const EdgeInsets.only(right: 2),
+                color: index < bars
+                    ? signalColor
+                    : Colors.grey.withOpacity(0.3),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  color: signalColor,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              Text(
+                "±${accuracy.toStringAsFixed(0)}m",
+                style: const TextStyle(color: Colors.white, fontSize: 9),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: STATUS BATERIA
+  // ============================================
+
+  Widget _buildBatteryStatus(int level, ThemeConfig theme) {
+    Color batteryColor;
+    if (level > 50) {
+      batteryColor = theme.primary;
+    } else if (level > 20) {
+      batteryColor = theme.warning;
+    } else {
+      batteryColor = theme.danger;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.8),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.battery_full, color: batteryColor, size: 18),
+          const SizedBox(width: 4),
+          Text(
+            "$level%",
+            style: TextStyle(
+              color: batteryColor,
+              fontSize: 12,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: ETIQUETA DE SEGMENTO
+  // ============================================
+
+  Widget _buildSegmentLabel(ThemeConfig theme) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: theme.glass.withOpacity(0.9),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: theme.primary, width: 1.5),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withOpacity(0.5),
+                blurRadius: 10,
+              ),
+            ],
+          ),
+          child: Column(
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.arrow_upward, color: theme.primary, size: 14),
+                  const SizedBox(width: 4),
+                  Text(
+                    "IDA: $_segmentLabelForward",
+                    style: TextStyle(
+                      color: theme.primary,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.arrow_downward, color: theme.danger, size: 14),
+                  const SizedBox(width: 4),
+                  Text(
+                    "VOLTA: $_segmentLabelReverse",
+                    style: TextStyle(
+                      color: theme.danger,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        ClipPath(
+          clipper: TriangleClipper(),
+          child: Container(
+            width: 12,
+            height: 8,
+            color: theme.primary,
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: ALERTA ÂNCORA
+  // ============================================
+
+  Widget _buildAnchorDragAlert(ThemeConfig theme) {
+    return Positioned(
+      top: MediaQuery.of(context).size.height / 3,
+      left: 40,
+      right: 40,
+      child: Container(
+        padding: const EdgeInsets.all(20),
+        decoration: BoxDecoration(
+          color: theme.danger,
+          borderRadius: BorderRadius.circular(16),
+          boxShadow: [
+            BoxShadow(
+              color: theme.danger.withOpacity(0.5),
+              blurRadius: 20,
+              spreadRadius: 5,
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.warning, color: Colors.white, size: 48),
+            const SizedBox(height: 12),
+            const Text(
+              "⚓ ÂNCORA ARRASTANDO!",
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.bold,
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              "Distância: ${_calculateAnchorDistance().toStringAsFixed(0)}m",
+              style: const TextStyle(color: Colors.white, fontSize: 14),
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton(
+              onPressed: () {
+                setState(() => _anchorStatus = AnchorAlarmStatus.inactive);
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.white,
+                foregroundColor: theme.danger,
+              ),
+              child: const Text("DESATIVAR ALARME"),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ============================================
+  // LÓGICA: ANCORAGEM
+  // ============================================
+
+  void _toggleAnchorAlarm() {
+    final gpsAsync = ref.read(currentPositionProvider);
+    if (gpsAsync.value == null) {
+      _showSnack("GPS não disponível", isError: true);
+      return;
+    }
+
+    if (_anchorStatus == AnchorAlarmStatus.inactive) {
+      setState(() {
+        _anchorPoint = LatLng(
+          gpsAsync.value!.latitude,
+          gpsAsync.value!.longitude,
+        );
+        _anchorStatus = AnchorAlarmStatus.active;
+      });
+      _showSnack("⚓ Âncora ativada - Raio: ${_anchorRadius.toInt()}m");
+    } else {
+      setState(() {
+        _anchorPoint = null;
+        _anchorStatus = AnchorAlarmStatus.inactive;
+      });
+      _showSnack("⚓ Âncora desativada");
+    }
+  }
+
+  void _checkAnchorDrag(LatLng currentPos) {
+    if (_anchorPoint == null) return;
+
+    final distance = _calculateAnchorDistance();
+    if (distance > _anchorRadius && _anchorStatus != AnchorAlarmStatus.dragging) {
+      setState(() => _anchorStatus = AnchorAlarmStatus.dragging);
+      
+      // Vibração e som (implementar com plugin)
+      HapticFeedback.heavyImpact();
+    }
+  }
+
+  double _calculateAnchorDistance() {
+    if (_anchorPoint == null) return 0;
+    final gpsAsync = ref.read(currentPositionProvider);
+    if (gpsAsync.value == null) return 0;
+
+    final currentPos = LatLng(
+      gpsAsync.value!.latitude,
+      gpsAsync.value!.longitude,
+    );
+
+    const distance = Distance();
+    return distance.as(LengthUnit.Meter, _anchorPoint!, currentPos);
+  }
+
+  // ============================================
+  // LÓGICA: MARCADOR DE PERIGO
+  // ============================================
+
+  void _addDangerMarker() {
+    final gpsAsync = ref.read(currentPositionProvider);
+    if (gpsAsync.value == null) {
+      _showSnack("GPS não disponível", isError: true);
+      return;
+    }
+
+    final dangerPoint = LatLng(
+      gpsAsync.value!.latitude,
+      gpsAsync.value!.longitude,
+    );
+
+    setState(() {
+      _dangerMarkers.add(dangerPoint);
+    });
+
+    _showSnack("⚠️ Perigo marcado", isError: false);
+  }
+
+  // ============================================
+  // LÓGICA: SELEÇÃO DE TEMA
+  // ============================================
+
+  void _showThemeSelector(BuildContext context, ThemeConfig theme) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Container(
+          decoration: BoxDecoration(
+            color: theme.glass,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: BackdropFilter(
+            filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+            child: Padding(
+              padding: const EdgeInsets.all(20.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "TEMA VISUAL",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _themeOption(
+                        Icons.shield,
+                        ThemeConfig.tactical.name,
+                        UITheme.tactical,
+                        ThemeConfig.tactical.primary,
+                      ),
+                      _themeOption(
+                        Icons.flight,
+                        ThemeConfig.aviation.name,
+                        UITheme.aviation,
+                        ThemeConfig.aviation.primary,
+                      ),
+                      _themeOption(
+                        Icons.sailing,
+                        ThemeConfig.maritime.name,
+                        UITheme.maritime,
+                        ThemeConfig.maritime.primary,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _themeOption(IconData icon, String label, UITheme theme, Color color) {
+    bool isSelected = _currentTheme == theme;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _currentTheme = theme);
+        Navigator.pop(context);
+      },
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isSelected ? color : Colors.white10,
+              shape: BoxShape.circle,
+              boxShadow: isSelected
+                  ? [BoxShadow(color: color, blurRadius: 10)]
+                  : [],
+            ),
+            child: Icon(
+              icon,
+              color: isSelected ? Colors.black : Colors.white,
+              size: 28,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: isSelected ? color : Colors.grey,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // LÓGICA: MAPA E NAVEGAÇÃO
+  // ============================================
+
+  void _showMapStyleSelector(BuildContext context, ThemeConfig theme) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Container(
+          decoration: BoxDecoration(
+            color: theme.glass,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: BackdropFilter(
+            filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+            child: Padding(
+              padding: const EdgeInsets.all(20.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "ESTILO DE MAPA",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _mapStyleOption(
+                        Icons.nightlight_round,
+                        "Tático",
+                        MapStyle.dark,
+                        theme,
+                      ),
+                      _mapStyleOption(
+                        Icons.satellite_alt,
+                        "Satélite",
+                        MapStyle.satellite,
+                        theme,
+                      ),
+                      _mapStyleOption(
+                        Icons.landscape,
+                        "Terreno",
+                        MapStyle.terrain,
+                        theme,
+                      ),
+                      _mapStyleOption(
+                        Icons.wb_sunny,
+                        "Claro",
+                        MapStyle.light,
+                        theme,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _mapStyleOption(
+    IconData icon,
+    String label,
+    MapStyle style,
+    ThemeConfig theme,
+  ) {
+    bool isSelected = _currentMapStyle == style;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _currentMapStyle = style);
+        Navigator.pop(context);
+      },
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isSelected ? theme.primary : Colors.white10,
+              shape: BoxShape.circle,
+              boxShadow: isSelected
+                  ? [BoxShadow(color: theme.primary, blurRadius: 10)]
+                  : [],
+            ),
+            child: Icon(
+              icon,
+              color: isSelected ? Colors.black : Colors.white,
+              size: 28,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: isSelected ? theme.primary : Colors.grey,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _toggleNavigationMode() {
+    setState(() {
+      if (_navMode == NavigationMode.northUp) {
+        _navMode = NavigationMode.courseUp;
+        _showSnack("Modo Proa (Livre)", isError: false);
+      } else {
+        _navMode = NavigationMode.northUp;
+        _mapController.rotate(0);
+        _showSnack("Modo Norte (Fixo)", isError: false);
+      }
+    });
+  }
+
+  Future<void> _handleGpxImport() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+      );
+      
+      if (result != null) {
+        final File file = File(result.files.single.path!);
+        final app_route.Route? route = await _gpxParser.parseGPXFile(file);
+
+        if (route != null) {
+          ref.read(navigationEngineProvider.notifier).startNavigation(route);
+          
+          if (route.points.isNotEmpty) {
+            _mapController.move(
+              LatLng(route.points.first.latitude, route.points.first.longitude),
+              16,
+            );
+          }
+          
+          _showSnack("Rota: ${route.name}", isError: false);
+        }
+      }
+    } catch (e) {
+      _logger.e("GPX Error: $e");
+      _showSnack("Erro ao importar GPX", isError: true);
+    }
+  }
+
+  void _handleMapTap(LatLng point, NavigationData navState) {
+    if (navState.activeRoute == null) return;
+
+    setState(() {
+      _selectedSegmentPoint = null;
+      _segmentLabelForward = null;
+      _segmentLabelReverse = null;
+    });
+
+    double minDistance = double.infinity;
+    int closestIndex = -1;
+    const Distance distanceCalc = Distance();
+
+    final points = navState.activeRoute!.points;
+    for (int i = 0; i < points.length - 1; i++) {
+      final p1 = LatLng(points[i].latitude, points[i].longitude);
+      final p2 = LatLng(points[i + 1].latitude, points[i + 1].longitude);
+
+      final center = LatLng(
+        (p1.latitude + p2.latitude) / 2,
+        (p1.longitude + p2.longitude) / 2,
+      );
+      
+      final dist = distanceCalc.as(LengthUnit.Meter, point, center);
+
+      if (dist < 500 && dist < minDistance) {
+        minDistance = dist;
+        closestIndex = i;
+      }
+    }
+
+    if (closestIndex != -1) {
+      final p1 = points[closestIndex];
+      final p2 = points[closestIndex + 1];
+
+      final bearingForward = distanceCalc.bearing(
+        LatLng(p1.latitude, p1.longitude),
+        LatLng(p2.latitude, p2.longitude),
+      );
+
+      double fwd = (bearingForward + 360) % 360;
+      double rev = (fwd + 180) % 360;
+
+      setState(() {
+        _selectedSegmentPoint = point;
+        _segmentLabelForward = "${fwd.toStringAsFixed(0)}°";
+        _segmentLabelReverse = "${rev.toStringAsFixed(0)}°";
+      });
+    }
+  }
+
+  void _showCalibrationDialog() {
+    if (!mounted) return;
+    
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: ThemeConfig.fromEnum(_currentTheme).glass,
+        title: Row(
+          children: [
+            Icon(
+              Icons.settings_input_antenna,
+              color: ThemeConfig.fromEnum(_currentTheme).primary,
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              "Calibração Necessária",
+              style: TextStyle(color: Colors.white),
+            ),
+          ],
+        ),
+        content: const Text(
+          "A bússola precisa ser calibrada.\n\n"
+          "Mova o dispositivo fazendo um '8' no ar.\n\n"
+          "Esta ação é necessária apenas uma vez por uso.",
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              setState(() => _isCalibrationNeeded = false);
+            },
+            child: Text(
+              "OK",
+              style: TextStyle(
+                color: ThemeConfig.fromEnum(_currentTheme).primary,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSnack(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError
+            ? ThemeConfig.fromEnum(_currentTheme).danger
+            : ThemeConfig.fromEnum(_currentTheme).primary,
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Widget _buildVignetteOverlay() {
+    return IgnorePointer(
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: RadialGradient(
+            colors: [
+              Colors.transparent,
+              Colors.black.withOpacity(0.5),
+            ],
+            radius: 1.2,
+            stops: const [0.7, 1.0],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ============================================
+  // UTILS
+  // ============================================
+
+  double _lerpHeading(double a, double b, double t) {
+    double diff = b - a;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    return a + diff * t;
+  }
+
+  double _lerpDouble(double a, double b, double t) => a + (b - a) * t;
+}
+
+// ============================================
+// CUSTOM PAINTERS
+// ============================================
+
+class CompassRosePainter extends CustomPainter {
+  final double heading;
+  final ThemeConfig theme;
+
+  CompassRosePainter({required this.heading, required this.theme});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint paint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+
+    final TextPainter tp = TextPainter(
+      textDirection: TextDirection.ltr,
+      textAlign: TextAlign.center,
+    );
+
+    double pixelPerDegree = size.width / 100;
+    double centerX = size.width / 2;
+
+    for (int i = (heading - 50).floor(); i <= (heading + 50).ceil(); i++) {
+      int deg = i % 360;
+      if (deg < 0) deg += 360;
+
+      double x = centerX + (i - heading) * pixelPerDegree;
+      double opacity = (1.0 - ((x - centerX).abs() / (size.width / 2)))
+          .clamp(0.0, 1.0);
+
+      paint.color = Colors.white.withOpacity(opacity);
+
+      if (deg % 90 == 0) {
+        String label = deg == 0
+            ? "N"
+            : deg == 90
+                ? "E"
+                : deg == 180
+                    ? "S"
+                    : "W";
+
+        tp.text = TextSpan(
+          text: label,
+          style: TextStyle(
+            color: label == "N"
+                ? theme.danger.withOpacity(opacity)
+                : Colors.white.withOpacity(opacity),
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+          ),
+        );
+
+        tp.layout();
+        tp.paint(canvas, Offset(x - tp.width / 2, 0));
+
+        paint.strokeWidth = 3;
+        canvas.drawLine(Offset(x, 25), Offset(x, 40), paint);
+      } else if (deg % 10 == 0) {
+        tp.text = TextSpan(
+          text: "${deg ~/ 10}",
+          style: TextStyle(
+            color: Colors.white.withOpacity(opacity),
+            fontSize: 12,
+          ),
+        );
+
+        tp.layout();
+        tp.paint(canvas, Offset(x - tp.width / 2, 8));
+
+        paint.strokeWidth = 1.5;
+        canvas.drawLine(Offset(x, 30), Offset(x, 40), paint);
+      } else if (deg % 5 == 0) {
+        paint.strokeWidth = 1;
+        canvas.drawLine(Offset(x, 35), Offset(x, 40), paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CompassRosePainter oldDelegate) =>
+      (oldDelegate.heading - heading).abs() > 0.1;
+}
+
+class TriangleClipper extends CustomClipper<ui.Path> {
+  @override
+  ui.Path getClip(Size size) {
+    final path = ui.Path();
+    path.moveTo(0, 0);
+    path.lineTo(size.width, 0);
+    path.lineTo(size.width / 2, size.height);
+    path.close();
+    return path;
+  }
+
+  @override
+  bool shouldReclip(TriangleClipper oldClipper) => false;
+}

@@ -1,23 +1,67 @@
-import 'dart:io';
+// ============================================
+// 📄 map_screen.dart - PARTE 1/3
+// ⚠️  COLE ESTE BLOCO NO INÍCIO DO ARQUIVO
+// ============================================
 
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:latlong2/latlong.dart';
-import 'package:file_picker/file_picker.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
-import 'package:hive/hive.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:logger/logger.dart';
 
 import '../../../../core/config/app_config.dart';
 import '../../../../data/models/route.dart' as app_route;
 import '../../../../data/services/compass_service.dart';
 import '../../../../data/services/gps_service.dart';
-import '../../../navigation/logic/navigation_engine.dart';
-import '../../../navigation/presentation/widgets/navigation_compass_tape.dart';
 import '../../../gpx/import/gpx_parser.dart';
+import '../../../navigation/logic/navigation_engine.dart';
 
-/// Map Screen - Primary navigation interface with map + compass tape
+// ============================================
+// DESIGN SYSTEM
+// ============================================
+
+const Color kTacticalGreen = Color(0xFF00FF41);
+const Color kTacticalCyan = Color(0xFF00E5FF);
+const Color kAlertRed = Color(0xFFFF2B2B);
+const Color kAlertOrange = Color(0xFFFF9100);
+const Color kGlassPanel = Color(0xCC111111);
+
+enum MapStyle { dark, satellite, light, terrain, topo3D }
+enum NavigationMode { northUp, courseUp }
+
+// ============================================
+// MODELO DE ROTA GPX CARREGADA
+// ============================================
+
+class LoadedGPXRoute {
+  final String id;
+  final String name;
+  final app_route.Route route;
+  bool isVisible;
+  Color color;
+
+  LoadedGPXRoute({
+    required this.id,
+    required this.name,
+    required this.route,
+    this.isVisible = true,
+    this.color = Colors.orange,
+  });
+}
+
+// ============================================
+// MAIN SCREEN
+// ============================================
+
 class MapScreen extends ConsumerStatefulWidget {
   const MapScreen({super.key});
 
@@ -25,717 +69,1338 @@ class MapScreen extends ConsumerStatefulWidget {
   ConsumerState<MapScreen> createState() => _MapScreenState();
 }
 
-class _MapScreenState extends ConsumerState<MapScreen> {
+class _MapScreenState extends ConsumerState<MapScreen>
+    with TickerProviderStateMixin {
   final MapController _mapController = MapController();
   final GPXParser _gpxParser = GPXParser();
   final Logger _logger = Logger();
-  
-  app_route.Route? _activeRoute;
-  bool _isMapReady = false;
-  bool _showBufferCircle = true;
-  
+
+  // Estado Local
+  double _smoothHeading = 0.0;
+  double _smoothSpeed = 0.0;
+  MapStyle _currentMapStyle = MapStyle.dark;
+  NavigationMode _navMode = NavigationMode.courseUp;
+  bool _hasCalibrated = false;
+
+  // Múltiplas rotas GPX
+  List<LoadedGPXRoute> _loadedRoutes = [];
+  String? _activeRouteId; // ID da rota sendo navegada
+
+  // Estado para etiqueta de segmento GPX
+  LatLng? _selectedSegmentPoint;
+  String? _segmentLabelForward;
+  String? _segmentLabelReverse;
+
   @override
   void initState() {
     super.initState();
-    _initializeServices();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _checkPermissionsAndStartSensors();
+    });
   }
 
-  /// Initialize GPS and Compass services
-  Future<void> _initializeServices() async {
-    final gpsService = ref.read(gpsServiceProvider);
-    final compassService = ref.read(compassServiceProvider);
-    
-    // Start GPS tracking
-    try {
-      await gpsService.startTracking();
-      _logger.i('GPS Service: Started successfully');
-    } catch (e) {
-      _logger.e('GPS Service: Failed to start', error: e);
-      if (mounted) {
-        _showError('GPS não disponível: $e');
-      }
+  Future<void> _checkPermissionsAndStartSensors() async {
+    ref.read(currentHeadingProvider);
+    ref.read(currentPositionProvider);
+
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
     }
-    
-    // Start compass tracking
-    try {
-      await compassService.startTracking();
-      _logger.i('Compass Service: Started successfully');
-    } catch (e) {
-      _logger.e('Compass Service: Failed to start', error: e);
-      if (mounted) {
-        _showError('Bússola não disponível: $e');
-      }
+
+    if (permission == LocationPermission.whileInUse ||
+        permission == LocationPermission.always) {
+      Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high)
+          .then((_) {})
+          .catchError((e) {});
     }
-    
-    // Check compass calibration
-    if (!compassService.isCalibrated) {
-      if (mounted) {
-        _showCalibrationDialog();
-      }
-    }
-    
-    setState(() {
-      _isMapReady = true;
-    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final navigationData = ref.watch(navigationEngineProvider);
-    final currentPosition = ref.watch(currentPositionProvider);
-    final currentHeadingAsync = ref.watch(currentHeadingProvider);
-    
-    // Extrai valor do AsyncValue
-    final double currentHeading = currentHeadingAsync.when(
-      data: (heading) => heading ?? 0.0,
-      loading: () => 0.0,
-      error: (_, __) => 0.0,
-    );
-    
+    final compassAsync = ref.watch(currentHeadingProvider);
+    final gpsAsync = ref.watch(currentPositionProvider);
+    final navigationState = ref.watch(navigationEngineProvider);
+
+    final double rawHeading = compassAsync.value ?? _smoothHeading;
+    final double rawSpeed = (gpsAsync.value?.speed ?? 0.0) * 3.6;
+
+    _smoothHeading = _lerpHeading(_smoothHeading, rawHeading, 0.15);
+    _smoothSpeed = _lerpDouble(_smoothSpeed, rawSpeed, 0.1);
+
+    final LatLng currentPos = gpsAsync.value != null
+        ? LatLng(gpsAsync.value!.latitude, gpsAsync.value!.longitude)
+        : const LatLng(-23.5505, -46.6333);
+
+    final double mapRotation =
+        _navMode == NavigationMode.courseUp ? -_smoothHeading : 0.0;
+
     return Scaffold(
-      backgroundColor: AppConfig.background,
-      body: SafeArea(
-        child: Column(
-          children: [
-            // Compass tape at top (always visible)
-            NavigationCompassTape(
-              currentHeading: currentHeading,
-              targetHeading: navigationData.targetHeading,
-              isForwardDirection: _activeRoute?.direction == app_route.RouteDirection.forward,
-              onToggleDirection: _activeRoute != null
-                  ? () => _toggleRouteDirection()
-                  : null,
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // 1. MAPA INTERATIVO
+          _buildFlutterMap(currentPos, navigationState, mapRotation),
+
+          // 2. VIGNETTE
+          if (_currentMapStyle != MapStyle.light) _buildVignetteOverlay(),
+
+          // 3. HUD SUPERIOR (Bússola)
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              bottom: false,
+              child: _buildAvionicsCompass(_smoothHeading),
             ),
-            
-            // Map area
-            Expanded(
-              child: Stack(
-                children: [
-                  // Map widget
-                  _buildMap(currentPosition.value, navigationData, currentHeading),
-                  
-                  // Loading overlay
-                  if (!_isMapReady)
-                    Container(
-                      color: Colors.black87,
-                      child: Center(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const CircularProgressIndicator(
-                              valueColor: AlwaysStoppedAnimation<Color>(AppConfig.success),
-                            ),
-                            const SizedBox(height: 16),
-                            Text(
-                              'Inicializando sensores...',
-                              style: TextStyle(
-                                color: AppConfig.textPrimary.withOpacity(0.8),
-                                fontSize: 16,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  
-                  // FAB for actions
-                  Positioned(
-                    right: 16,
-                    bottom: 16,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        // Import GPX button
-                        FloatingActionButton(
-                          heroTag: 'import_gpx',
-                          onPressed: _importGPX,
-                          backgroundColor: AppConfig.success,
-                          tooltip: 'Importar GPX',
-                          child: const Icon(Icons.upload_file, color: Colors.black),
-                        ),
-                        const SizedBox(height: 12),
-                        
-                        // Toggle buffer circle
-                        if (_activeRoute != null)
-                          FloatingActionButton.small(
-                            heroTag: 'toggle_buffer',
-                            onPressed: () {
-                              setState(() {
-                                _showBufferCircle = !_showBufferCircle;
-                              });
-                            },
-                            backgroundColor: _showBufferCircle 
-                                ? AppConfig.warning 
-                                : Colors.grey,
-                            tooltip: 'Buffer de desvio',
-                            child: Icon(
-                              _showBufferCircle ? Icons.visibility : Icons.visibility_off,
-                              color: Colors.black,
-                            ),
-                          ),
-                        const SizedBox(height: 12),
-                        
-                        // Center on position button
-                        if (currentPosition.value != null)
-                          FloatingActionButton.small(
-                            heroTag: 'center_position',
-                            onPressed: () => _centerOnPosition(currentPosition.value!),
-                            backgroundColor: AppConfig.compassNeedle,
-                            tooltip: 'Centralizar posição',
-                            child: const Icon(Icons.my_location, color: Colors.black),
-                          ),
-                        const SizedBox(height: 12),
-                        
-                        // Toggle instrument mode
-                        FloatingActionButton(
-                          heroTag: 'instrument_mode',
-                          onPressed: () => context.go('/instruments'),
-                          backgroundColor: AppConfig.warning,
-                          tooltip: 'Modo Instrumentos',
-                          child: const Icon(Icons.speed, color: Colors.black),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
+          ),
+
+          // 4. PAINEL INFERIOR (Dashboard)
+          Positioned(
+            bottom: 30,
+            left: 16,
+            right: 16,
+            child: SafeArea(
+              top: false,
+              child:
+                  _buildTacticalDashboard(_smoothSpeed, navigationState, gpsAsync),
             ),
-            
-            // Metrics bar at bottom (CORRIGIDO: Overflow)
-            Container(
-              constraints: BoxConstraints(
-                maxHeight: AppConfig.metricsBarHeight,
-              ),
-              child: SingleChildScrollView(
-                child: _buildMetricsBar(navigationData, currentPosition.value),
-              ),
+          ),
+
+          // 5. CONTROLES LATERAIS ESQUERDOS
+          Positioned(
+            left: 16,
+            top: MediaQuery.of(context).padding.top + 130,
+            child: Column(
+              children: [
+                _buildCircleButton(Icons.layers,
+                    () => _showMapStyleSelector(context)),
+                const SizedBox(height: 12),
+                _buildCircleButton(Icons.folder_open, _handleGpxImport),
+                const SizedBox(height: 12),
+                _buildCircleButton(
+                    Icons.route, () => _showRoutesManager(context)),
+                const SizedBox(height: 12),
+                _buildCircleButton(
+                    Icons.settings_input_antenna, _showCalibrationDialog),
+              ],
             ),
-          ],
-        ),
+          ),
+
+          // 6. CONTROLES LATERAIS DIREITOS
+          Positioned(
+            right: 16,
+            bottom: 180,
+            child: Column(
+              children: [
+                _buildMiniButton(Icons.add, () {
+                  final currZoom = _mapController.camera.zoom;
+                  _mapController.move(
+                      _mapController.camera.center, currZoom + 1);
+                }),
+                const SizedBox(height: 8),
+                _buildMiniButton(Icons.remove, () {
+                  final currZoom = _mapController.camera.zoom;
+                  _mapController.move(
+                      _mapController.camera.center, currZoom - 1);
+                }),
+                const SizedBox(height: 20),
+                _buildCircleButton(Icons.my_location, () {
+                  ref.refresh(currentPositionProvider);
+                  _mapController.move(currentPos, 16);
+                }),
+                const SizedBox(height: 12),
+                _buildCircleButton(
+                  _navMode == NavigationMode.northUp
+                      ? Icons.explore
+                      : Icons.navigation,
+                  _toggleNavigationMode,
+                  active: _navMode == NavigationMode.courseUp,
+                ),
+              ],
+            ),
+          ),
+
+          // 7. STATUS SUPERIORES
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 10,
+            left: 16,
+            child: _buildDjiGpsStatus(gpsAsync),
+          ),
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 10,
+            right: 16,
+            child: _buildDirectionStatus(_smoothHeading),
+          ),
+        ],
       ),
     );
   }
 
-  /// Build map widget
-  Widget _buildMap(dynamic position, NavigationData navigationData, double currentHeading) {
-    // Default center (if no GPS)
-    LatLng center = const LatLng(-23.5505, -46.6333); // São Paulo
-    double zoom = 10.0;
-    
-    if (position != null) {
-      center = LatLng(position.latitude, position.longitude);
-      zoom = AppConfig.defaultMapZoom;
+  // ============================================
+  // COMPONENTE: MAPA
+  // ============================================
+
+  Widget _buildFlutterMap(
+    LatLng center,
+    NavigationData navState,
+    double rotation,
+  ) {
+    String urlTemplate;
+    switch (_currentMapStyle) {
+      case MapStyle.satellite:
+        urlTemplate =
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+        break;
+      case MapStyle.terrain:
+        urlTemplate = 'https://mt0.google.com/vt/lyrs=p&x={x}&y={y}&z={z}';
+        break;
+      case MapStyle.topo3D:
+        // Mapa Topográfico 3D (Thunderforest Outdoors - Gratuito até 150k tiles/mês)
+        urlTemplate =
+            'https://tile.thunderforest.com/outdoors/{z}/{x}/{y}.png?apikey=390a046832534c7c9d2e44227a9fcd92';
+        break;
+      case MapStyle.light:
+        urlTemplate =
+            'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+        break;
+      case MapStyle.dark:
+      default:
+        urlTemplate =
+            'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
+        break;
     }
-    
+
     return FlutterMap(
       mapController: _mapController,
       options: MapOptions(
         initialCenter: center,
-        initialZoom: zoom,
-        minZoom: 5.0,
-        maxZoom: 18.0,
-        interactionOptions: const InteractionOptions(
-          flags: InteractiveFlag.all,
+        initialZoom: 16.0,
+        initialRotation: rotation,
+        backgroundColor: Colors.black,
+        onTap: (tapPos, point) => _handleMapTap(point),
+        interactionOptions: InteractionOptions(
+          flags: _navMode == NavigationMode.courseUp
+              ? InteractiveFlag.all & ~InteractiveFlag.rotate
+              : InteractiveFlag.all,
         ),
       ),
       children: [
-        // Base map tiles
         TileLayer(
-          urlTemplate: AppConfig.osmTileUrl,
+          urlTemplate: urlTemplate,
+          subdomains: _currentMapStyle == MapStyle.terrain ||
+                  _currentMapStyle == MapStyle.topo3D
+              ? const []
+              : const ['a', 'b', 'c', 'd'],
           userAgentPackageName: 'com.navigatorjet.app',
-          tileBuilder: (context, widget, tile) {
-            // Darken tiles for better contrast
-            return ColorFiltered(
-              colorFilter: ColorFilter.mode(
-                Colors.black.withOpacity(0.2),
-                BlendMode.darken,
-              ),
-              child: widget,
-            );
-          },
+          retinaMode: true,
         ),
-        
-        // Buffer circle (if active and enabled)
-        if (_activeRoute != null && position != null && _showBufferCircle)
-          CircleLayer(
-            circles: [
-              CircleMarker(
-                point: LatLng(position.latitude, position.longitude),
-                radius: navigationData.bufferRadius,
-                useRadiusInMeter: true,
-                color: AppConfig.success.withOpacity(0.1),
-                borderColor: AppConfig.success.withOpacity(0.3),
-                borderStrokeWidth: 2,
-              ),
-            ],
-          ),
-        
-        // Route line (if active)
-        if (_activeRoute != null)
-          PolylineLayer(
-            polylines: [
-              Polyline(
-                points: _activeRoute!.orderedPoints
-                    .map((p) => LatLng(p.latitude, p.longitude))
-                    .toList(),
-                strokeWidth: AppConfig.trackLineWidth,
-                color: _activeRoute!.direction == app_route.RouteDirection.forward
-                    ? AppConfig.forwardTrackColor
-                    : AppConfig.reverseTrackColor,
-              ),
-            ],
-          ),
-        
-        // Waypoint markers (if active route)
-        if (_activeRoute != null)
-          MarkerLayer(
-            markers: _buildWaypointMarkers(navigationData),
-          ),
-        
-        // Current position marker
-        if (position != null)
+
+        // TODAS as rotas carregadas (visíveis)
+        ..._loadedRoutes
+            .where((r) => r.isVisible)
+            .map((loadedRoute) => PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: loadedRoute.route.points
+                          .map((p) => LatLng(p.latitude, p.longitude))
+                          .toList(),
+                      strokeWidth: 5.0,
+                      color: loadedRoute.color,
+                      pattern: const StrokePattern.solid(),
+                    ),
+                  ],
+                ))
+            .toList(),
+
+        // Marcador de Segmento (Etiqueta)
+        if (_selectedSegmentPoint != null)
           MarkerLayer(
             markers: [
               Marker(
-                point: LatLng(position.latitude, position.longitude),
-                width: 40,
-                height: 40,
-                child: Transform.rotate(
-                  angle: currentHeading * (3.14159 / 180),
-                  child: const Icon(
-                    Icons.navigation,
-                    color: AppConfig.compassNeedle,
-                    size: 40,
-                    shadows: [
-                      Shadow(
-                        color: Colors.black,
-                        blurRadius: 8,
-                      ),
-                    ],
-                  ),
-                ),
+                point: _selectedSegmentPoint!,
+                width: 200,
+                height: 90,
+                child: _buildSegmentLabel(),
+                alignment: Alignment.topCenter,
               ),
             ],
           ),
-        
-        // Attribution
-        const RichAttributionWidget(
-          attributions: [
-            TextSourceAttribution('OpenStreetMap contributors'),
+
+        // Marcador do Navio
+        MarkerLayer(
+          markers: [
+            Marker(
+              point: center,
+              width: 80,
+              height: 80,
+              child: _buildNavigationMarker(),
+            ),
           ],
         ),
       ],
     );
   }
 
-  /// Build waypoint markers for route
-  List<Marker> _buildWaypointMarkers(NavigationData navigationData) {
-    if (_activeRoute == null) return [];
-    
-    final markers = <Marker>[];
-    final points = _activeRoute!.orderedPoints;
-    
-    // Show first, last, and current target waypoint
-    final indicesToShow = <int>{
-      0, // First
-      points.length - 1, // Last
-      if (navigationData.currentWaypointIndex < points.length)
-        navigationData.currentWaypointIndex, // Current target
-    };
-    
-    for (final i in indicesToShow) {
-      final point = points[i];
-      final isCurrent = i == navigationData.currentWaypointIndex;
-      final isFirst = i == 0;
-      final isLast = i == points.length - 1;
-      
-      markers.add(
-        Marker(
-          point: LatLng(point.latitude, point.longitude),
-          width: 30,
-          height: 30,
-          child: Container(
-            decoration: BoxDecoration(
-              color: isCurrent 
-                  ? AppConfig.compassTarget 
-                  : isFirst 
-                      ? AppConfig.success 
-                      : isLast 
-                          ? AppConfig.danger 
-                          : Colors.white,
-              shape: BoxShape.circle,
-              border: Border.all(color: Colors.white, width: 2),
-              boxShadow: const [
-                BoxShadow(
-                  color: Colors.black54,
-                  blurRadius: 4,
-                ),
-              ],
-            ),
-            child: Center(
-              child: Text(
-                '${i + 1}',
-                style: const TextStyle(
-                  color: Colors.black,
-                  fontWeight: FontWeight.bold,
-                  fontSize: 12,
-                ),
+  Widget _buildSegmentLabel() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            color: kGlassPanel.withOpacity(0.9),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: kTacticalGreen, width: 1.5),
+            boxShadow: [
+              BoxShadow(
+                  color: Colors.black.withOpacity(0.5), blurRadius: 10),
+            ],
+          ),
+          child: Column(
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.arrow_upward,
+                      color: kTacticalGreen, size: 14),
+                  const SizedBox(width: 4),
+                  Text(
+                    "IDA: $_segmentLabelForward",
+                    style: const TextStyle(
+                      color: kTacticalGreen,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
               ),
-            ),
+              const SizedBox(height: 4),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.arrow_downward,
+                      color: kAlertRed, size: 14),
+                  const SizedBox(width: 4),
+                  Text(
+                    "VOLTA: $_segmentLabelReverse",
+                    style: const TextStyle(
+                      color: kAlertRed,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
-      );
-    }
-    
-    return markers;
+        ClipPath(
+          clipper: TriangleClipper(),
+          child: Container(
+            width: 12,
+            height: 8,
+            color: kTacticalGreen,
+          ),
+        ),
+      ],
+    );
   }
 
-  /// Build metrics bar at bottom
-  Widget _buildMetricsBar(NavigationData navigationData, dynamic position) {
-    final gpsService = ref.read(gpsServiceProvider);
-    final speed = gpsService.currentSpeed ?? 0.0;
-    final batteryLevel = 85; // TODO: Integrate battery_plus
-    
+  Widget _buildNavigationMarker() {
+    double iconRotation = _navMode == NavigationMode.courseUp
+        ? 0.0
+        : (_smoothHeading * (math.pi / 180));
+
+    return Transform.rotate(
+      angle: iconRotation,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          Container(
+            width: 20,
+            height: 20,
+            decoration: BoxDecoration(
+              color: kTacticalGreen.withOpacity(0.3),
+              shape: BoxShape.circle,
+              boxShadow: const [
+                BoxShadow(
+                  color: kTacticalGreen,
+                  blurRadius: 10,
+                  spreadRadius: 2,
+                )
+              ],
+            ),
+          ),
+          const Icon(Icons.navigation, color: kTacticalGreen, size: 48),
+        ],
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTE: HUD BÚSSOLA
+  // ============================================
+
+  Widget _buildAvionicsCompass(double heading) {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      height: 90,
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
-            Colors.black.withOpacity(0.8),
-            Colors.black.withOpacity(0.95),
+            Colors.black.withOpacity(0.9),
+            Colors.transparent,
           ],
         ),
       ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceAround,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
         children: [
-          // Speed
-          _buildMetric(
-            icon: Icons.speed,
-            label: 'VEL',
-            value: '${speed.toStringAsFixed(1)}',
-            unit: 'km/h',
-            color: AppConfig.success,
+          Text(
+            "${heading.toStringAsFixed(0)}°",
+            style: const TextStyle(
+              color: kTacticalGreen,
+              fontSize: 28,
+              fontWeight: FontWeight.w900,
+              fontFamily: 'monospace',
+              shadows: [Shadow(color: kTacticalGreen, blurRadius: 8)],
+            ),
           ),
-          
-          // Distance to target
-          if (navigationData.distanceToTarget != null)
-            _buildMetric(
-              icon: Icons.flag,
-              label: 'DIST',
-              value: navigationData.distanceToTarget! < 1000
-                  ? navigationData.distanceToTarget!.toStringAsFixed(0)
-                  : (navigationData.distanceToTarget! / 1000).toStringAsFixed(2),
-              unit: navigationData.distanceToTarget! < 1000 ? 'm' : 'km',
-              color: AppConfig.textPrimary,
+          Expanded(
+            child: Stack(
+              alignment: Alignment.bottomCenter,
+              children: [
+                CustomPaint(
+                  painter: TacticalCompassPainter(heading: heading),
+                  size: const Size(double.infinity, 40),
+                ),
+                const Icon(Icons.arrow_drop_up, color: kAlertRed, size: 30),
+              ],
             ),
-          
-          // Cross-track distance (buffer status)
-          if (navigationData.crossTrackDistance != null)
-            _buildMetric(
-              icon: Icons.straighten,
-              label: 'DESVIO',
-              value: '${navigationData.crossTrackDistance!.abs().toStringAsFixed(0)}',
-              unit: 'm',
-              color: AppConfig.getBufferStatusColor(
-                navigationData.crossTrackDistance!,
-                navigationData.bufferRadius,
-              ),
-            ),
-          
-          // Battery
-          _buildMetric(
-            icon: Icons.battery_full,
-            label: 'BAT',
-            value: '$batteryLevel',
-            unit: '%',
-            color: batteryLevel > 20 ? AppConfig.success : AppConfig.danger,
           ),
         ],
       ),
     );
   }
 
-  /// Build single metric widget
-  Widget _buildMetric({
-    required IconData icon,
-    required String label,
-    required String value,
-    required String unit,
-    required Color color,
-  }) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, color: color, size: 20),
-        const SizedBox(height: 4),
-        Text(
-          label,
-          style: TextStyle(
-            color: color.withOpacity(0.7),
-            fontSize: 9,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 0.5,
+  // ============================================
+  // COMPONENTE: DASHBOARD
+  // ============================================
+
+  Widget _buildTacticalDashboard(
+    double speed,
+    NavigationData navState,
+    AsyncValue gpsAsync,
+  ) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          decoration: BoxDecoration(
+            color: kGlassPanel,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.white24, width: 0.5),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              // VELOCIDADE
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text("VELOCIDADE",
+                      style: TextStyle(color: Colors.grey, fontSize: 10)),
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.baseline,
+                    textBaseline: TextBaseline.alphabetic,
+                    children: [
+                      Text(
+                        speed.toStringAsFixed(0),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 44,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const Text(
+                        " km/h",
+                        style: TextStyle(color: kTacticalGreen, fontSize: 14),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+
+              Container(width: 1, height: 40, color: Colors.white12),
+
+              // RUMO & DIST
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _buildInfoRow(
+                    "RUMO",
+                    "${gpsAsync.value?.heading?.toStringAsFixed(0) ?? '000'}°",
+                  ),
+                  const SizedBox(height: 4),
+                  _buildInfoRow(
+                    "DIST",
+                    navState.distanceToTarget != null
+                        ? "${(navState.distanceToTarget! / 1000).toStringAsFixed(1)}km"
+                        : "--",
+                  ),
+                ],
+              ),
+
+              // VOLTA (Inverter rota ativa)
+              InkWell(
+                onTap: () {
+                  if (_activeRouteId != null) {
+                    ref
+                        .read(navigationEngineProvider.notifier)
+                        .toggleRouteDirection();
+                    _showSnack("Rota Invertida");
+                    setState(() {});
+                  }
+                },
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: kAlertRed.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: kAlertRed),
+                  ),
+                  child: const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.swap_vert, color: kAlertRed, size: 20),
+                      Text(
+                        "VOLTA",
+                        style: TextStyle(
+                          color: kAlertRed,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ),
         ),
-        const SizedBox(height: 2),
-        Row(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.baseline,
-          textBaseline: TextBaseline.alphabetic,
-          children: [
-            Text(
-              value,
-              style: TextStyle(
-                color: color,
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-                fontFamily: 'monospace',
-              ),
-            ),
-            const SizedBox(width: 2),
-            Text(
-              unit,
-              style: TextStyle(
-                color: color.withOpacity(0.8),
-                fontSize: 10,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ],
+      ),
+    );
+  }
+
+  Widget _buildInfoRow(String label, String value) {
+    return Row(
+      children: [
+        Text(
+          "$label ",
+          style: const TextStyle(color: Colors.grey, fontSize: 10),
+        ),
+        Text(
+          value,
+          style: const TextStyle(
+            color: kTacticalCyan,
+            fontSize: 12,
+            fontWeight: FontWeight.bold,
+          ),
         ),
       ],
     );
   }
 
-  /// Import GPX file (CORRIGIDO: Feedback visual + tratamento de erros)
-  Future<void> _importGPX() async {
-    try {
-      // Mostra loading enquanto seleciona arquivo
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => const Center(
-          child: CircularProgressIndicator(
-            valueColor: AlwaysStoppedAnimation<Color>(AppConfig.success),
-          ),
-        ),
-      );
+// ============================================
+// 🔚 FIM DA PARTE 1/3
+// ⚠️  CONTINUE COM A PARTE 2/3
+// ============================================
+// ============================================
+// 📄 map_screen.dart - PARTE 2/3
+// ⚠️  COLE ESTE BLOCO APÓS A PARTE 1/3
+// ============================================
 
-      final result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['gpx', 'kml'],
-        dialogTitle: 'Selecione uma rota GPX/KML',
-      );
+  // COMPONENTES DE STATUS (continuação da classe _MapScreenState)
 
-      // Remove loading dialog
-      if (mounted) Navigator.pop(context);
-
-      if (result == null || result.files.single.path == null) {
-        _logger.w('GPX Import: User cancelled');
-        return;
-      }
-
-      final file = File(result.files.single.path!);
-      _logger.i('GPX Import: File selected - ${file.path}');
-
-      // Mostra progresso de parsing
-      if (mounted) {
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) => AlertDialog(
-            backgroundColor: Colors.black87,
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const CircularProgressIndicator(
-                  valueColor: AlwaysStoppedAnimation<Color>(AppConfig.success),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  'Processando GPX...',
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.9),
-                    fontSize: 16,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      }
-
-      // Parse GPX
-      final route = await _gpxParser.parseGPXFile(file);
-
-      // Remove parsing dialog
-      if (mounted) Navigator.pop(context);
-
-      if (route == null) {
-        if (mounted) {
-          _showError('Erro ao importar GPX.\n\nArquivo inválido ou corrompido.');
-        }
-        return;
-      }
-
-      _logger.i('GPX Import: Route parsed - ${route.name} (${route.waypointCount} pontos)');
-
-      // Salva rota no Hive
-      final routesBox = Hive.box<app_route.Route>('routes');
-      await routesBox.put(route.id, route);
-      _logger.i('GPX Import: Route saved to Hive');
-
-      setState(() {
-        _activeRoute = route;
-      });
-
-      // Start navigation
-      ref.read(navigationEngineProvider.notifier).startNavigation(route);
-
-      // Fit map to route bounds
-      final bounds = route.getBounds();
-      _mapController.fitCamera(
-        CameraFit.bounds(
-          bounds: LatLngBounds(bounds.southwest, bounds.northeast),
-          padding: const EdgeInsets.all(50),
-        ),
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Row(
-              children: [
-                const Icon(Icons.check_circle, color: Colors.white),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        'Rota "${route.name}" carregada!',
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 16,
-                        ),
-                      ),
-                      Text(
-                        '${route.waypointCount} pontos • ${(route.totalDistance / 1000).toStringAsFixed(2)} km',
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-            backgroundColor: AppConfig.success,
-            duration: const Duration(seconds: 4),
-          ),
-        );
-      }
-    } catch (e, stackTrace) {
-      _logger.e('GPX Import: Error', error: e, stackTrace: stackTrace);
-      if (mounted) {
-        Navigator.of(context).popUntil((route) => route.isFirst);
-        _showError('Erro ao importar GPX:\n\n$e');
-      }
+  Widget _buildDjiGpsStatus(AsyncValue gpsAsync) {
+    double accuracy = 999;
+    if (gpsAsync.hasValue && gpsAsync.value != null) {
+      accuracy = gpsAsync.value!.accuracy;
     }
-  }
 
-  /// Toggle route direction (CORRIGIDO: Feedback visual)
-  void _toggleRouteDirection() {
-    if (_activeRoute == null) return;
-    
-    ref.read(navigationEngineProvider.notifier).toggleRouteDirection();
-    
-    setState(() {
-      // Força rebuild para mostrar mudança de cor
-    });
-    
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          _activeRoute!.direction == app_route.RouteDirection.forward
-              ? '⬆️ Navegando em IDA'
-              : '⬇️ Navegando em VOLTA',
-        ),
-        backgroundColor: _activeRoute!.direction == app_route.RouteDirection.forward
-            ? AppConfig.success
-            : AppConfig.warning,
-        duration: const Duration(seconds: 2),
+    Color signalColor;
+    String label;
+    int bars;
+
+    if (!gpsAsync.hasValue || gpsAsync.value == null) {
+      signalColor = kAlertRed;
+      label = "N/A";
+      bars = 0;
+    } else if (accuracy <= 5) {
+      signalColor = kTacticalGreen;
+      label = "GPS 3D";
+      bars = 4;
+    } else if (accuracy <= 10) {
+      signalColor = kTacticalGreen;
+      label = "READY";
+      bars = 3;
+    } else if (accuracy <= 20) {
+      signalColor = kAlertOrange;
+      label = "WEAK";
+      bars = 2;
+    } else {
+      signalColor = kAlertRed;
+      label = "POOR";
+      bars = 1;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.8),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: signalColor.withOpacity(0.5)),
       ),
-    );
-  }
-
-  /// Center map on current position
-  void _centerOnPosition(dynamic position) {
-    _mapController.move(
-      LatLng(position.latitude, position.longitude),
-      AppConfig.defaultMapZoom,
-    );
-  }
-
-  /// Show calibration dialog
-  void _showCalibrationDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        title: const Row(
-          children: [
-            Icon(Icons.explore, color: AppConfig.warning, size: 32),
-            SizedBox(width: 12),
-            Text(
-              'Calibração da Bússola',
-              style: TextStyle(color: AppConfig.warning),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: List.generate(
+              4,
+              (index) => Container(
+                width: 3,
+                height: 6.0 + (index * 3),
+                margin: const EdgeInsets.only(right: 2),
+                color: index < bars
+                    ? signalColor
+                    : Colors.grey.withOpacity(0.3),
+              ),
             ),
-          ],
-        ),
-        content: const Text(
-          'Para melhor precisão, mova o celular em forma de "8" no ar.\n\n'
-          'Isso calibra o magnetômetro.',
-          style: TextStyle(color: AppConfig.textPrimary, fontSize: 16),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK', style: TextStyle(color: AppConfig.success)),
+          ),
+          const SizedBox(width: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  color: signalColor,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              Text(
+                "±${accuracy.toStringAsFixed(0)}m",
+                style: const TextStyle(color: Colors.white, fontSize: 9),
+              ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  /// Show error message
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Row(
-          children: [
-            const Icon(Icons.error_outline, color: Colors.white),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                message,
-                style: const TextStyle(fontSize: 14),
-              ),
-            ),
-          ],
+  Widget _buildDirectionStatus(double heading) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.8),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Text(
+        "${heading.toStringAsFixed(0)}°",
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
         ),
-        backgroundColor: AppConfig.danger,
-        duration: const Duration(seconds: 5),
       ),
     );
   }
 
-  @override
-  void dispose() {
-    _mapController.dispose();
-    super.dispose();
+  // ============================================
+  // GERENCIADOR DE ROTAS MÚLTIPLAS
+  // ============================================
+
+  void _showRoutesManager(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return Container(
+              height: MediaQuery.of(context).size.height * 0.7,
+              decoration: const BoxDecoration(
+                color: kGlassPanel,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+              ),
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                child: Column(
+                  children: [
+                    // Header
+                    Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text(
+                            "ROTAS CARREGADAS",
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.close, color: Colors.white),
+                            onPressed: () => Navigator.pop(context),
+                          ),
+                        ],
+                      ),
+                    ),
+
+                    // Lista de Rotas
+                    Expanded(
+                      child: _loadedRoutes.isEmpty
+                          ? const Center(
+                              child: Text(
+                                "Nenhuma rota carregada",
+                                style: TextStyle(color: Colors.grey),
+                              ),
+                            )
+                          : ListView.builder(
+                              itemCount: _loadedRoutes.length,
+                              itemBuilder: (context, index) {
+                                final route = _loadedRoutes[index];
+                                final isActive = route.id == _activeRouteId;
+
+                                return Container(
+                                  margin: const EdgeInsets.symmetric(
+                                      horizontal: 16, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: isActive
+                                        ? kTacticalGreen.withOpacity(0.2)
+                                        : Colors.white10,
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(
+                                      color: isActive
+                                          ? kTacticalGreen
+                                          : Colors.white24,
+                                    ),
+                                  ),
+                                  child: ListTile(
+                                    leading: Icon(
+                                      Icons.route,
+                                      color: route.color,
+                                    ),
+                                    title: Text(
+                                      route.name,
+                                      style:
+                                          const TextStyle(color: Colors.white),
+                                    ),
+                                    subtitle: Text(
+                                      "${route.route.points.length} pontos",
+                                      style:
+                                          const TextStyle(color: Colors.grey),
+                                    ),
+                                    trailing: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        // Trocar cor
+                                        IconButton(
+                                          icon: Icon(Icons.palette,
+                                              color: route.color),
+                                          onPressed: () {
+                                            _showColorPicker(
+                                                context, route, setModalState);
+                                          },
+                                        ),
+                                        // Visibilidade
+                                        IconButton(
+                                          icon: Icon(
+                                            route.isVisible
+                                                ? Icons.visibility
+                                                : Icons.visibility_off,
+                                            color: Colors.white,
+                                          ),
+                                          onPressed: () {
+                                            setModalState(() {
+                                              route.isVisible =
+                                                  !route.isVisible;
+                                            });
+                                            setState(() {});
+                                          },
+                                        ),
+                                        // Navegar
+                                        IconButton(
+                                          icon: Icon(
+                                            Icons.navigation,
+                                            color: isActive
+                                                ? kTacticalGreen
+                                                : Colors.white,
+                                          ),
+                                          onPressed: () {
+                                            _activateRoute(route.id);
+                                            setModalState(() {});
+                                            setState(() {});
+                                          },
+                                        ),
+                                        // Deletar
+                                        IconButton(
+                                          icon: const Icon(Icons.delete,
+                                              color: kAlertRed),
+                                          onPressed: () {
+                                            setModalState(() {
+                                              _loadedRoutes.remove(route);
+                                              if (_activeRouteId == route.id) {
+                                                _activeRouteId = null;
+                                                ref
+                                                    .read(
+                                                        navigationEngineProvider
+                                                            .notifier)
+                                                    .stopNavigation();
+                                              }
+                                            });
+                                            setState(() {});
+                                          },
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
+
+  void _showColorPicker(
+      BuildContext context, LoadedGPXRoute route, StateSetter setModalState) {
+    final colors = [
+      Colors.orange,
+      Colors.blue,
+      Colors.red,
+      Colors.green,
+      Colors.purple,
+      Colors.yellow,
+      Colors.pink,
+      Colors.cyan,
+    ];
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          backgroundColor: kGlassPanel,
+          title: const Text("Escolher Cor",
+              style: TextStyle(color: Colors.white)),
+          content: Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: colors.map((color) {
+              return GestureDetector(
+                onTap: () {
+                  setModalState(() {
+                    route.color = color;
+                  });
+                  setState(() {});
+                  Navigator.pop(context);
+                },
+                child: Container(
+                  width: 40,
+                  height: 40,
+                  decoration: BoxDecoration(
+                    color: color,
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: route.color == color
+                          ? Colors.white
+                          : Colors.transparent,
+                      width: 3,
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        );
+      },
+    );
+  }
+
+  void _activateRoute(String routeId) {
+    final route = _loadedRoutes.firstWhere((r) => r.id == routeId);
+    _activeRouteId = routeId;
+    ref.read(navigationEngineProvider.notifier).startNavigation(route.route);
+
+    if (route.route.points.isNotEmpty) {
+      _mapController.move(
+        LatLng(
+          route.route.points.first.latitude,
+          route.route.points.first.longitude,
+        ),
+        16,
+      );
+    }
+
+    _showSnack("Navegando: ${route.name}");
+  }
+
+  // ============================================
+  // LÓGICA: IMPORTAÇÃO GPX
+  // ============================================
+
+  Future<void> _handleGpxImport() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        allowMultiple: false,
+      );
+
+      if (result != null) {
+        final File file = File(result.files.single.path!);
+        final app_route.Route? route = await _gpxParser.parseGPXFile(file);
+
+        if (route != null) {
+          // Gera ID único e cor aleatória
+          final id = DateTime.now().millisecondsSinceEpoch.toString();
+          final colors = [
+            Colors.orange,
+            Colors.blue,
+            Colors.red,
+            Colors.green,
+            Colors.purple,
+            Colors.cyan,
+          ];
+          final randomColor = colors[math.Random().nextInt(colors.length)];
+
+          final loadedRoute = LoadedGPXRoute(
+            id: id,
+            name: route.name.isEmpty
+                ? "Rota ${_loadedRoutes.length + 1}"
+                : route.name,
+            route: route,
+            color: randomColor,
+          );
+
+          setState(() {
+            _loadedRoutes.add(loadedRoute);
+          });
+
+          _showSnack("Rota carregada: ${loadedRoute.name}");
+        }
+      }
+    } catch (e) {
+      _logger.e("GPX Error: $e");
+      _showSnack("Erro ao importar GPX", isError: true);
+    }
+  }
+
+  // ============================================
+  // LÓGICA: MAPA E NAVEGAÇÃO
+  // ============================================
+
+  void _handleMapTap(LatLng point) {
+    // Encontra a rota ATIVA para mostrar etiquetas
+    if (_activeRouteId == null) return;
+
+    final activeRoute =
+        _loadedRoutes.firstWhere((r) => r.id == _activeRouteId);
+
+    setState(() {
+      _selectedSegmentPoint = null;
+      _segmentLabelForward = null;
+      _segmentLabelReverse = null;
+    });
+
+    double minDistance = double.infinity;
+    int closestIndex = -1;
+    const Distance distanceCalc = Distance();
+
+    final points = activeRoute.route.points;
+    for (int i = 0; i < points.length - 1; i++) {
+      final p1 = LatLng(points[i].latitude, points[i].longitude);
+      final p2 = LatLng(points[i + 1].latitude, points[i + 1].longitude);
+
+      final center = LatLng(
+        (p1.latitude + p2.latitude) / 2,
+        (p1.longitude + p2.longitude) / 2,
+      );
+
+      final dist = distanceCalc.as(LengthUnit.Meter, point, center);
+
+      if (dist < 500 && dist < minDistance) {
+        minDistance = dist;
+        closestIndex = i;
+      }
+    }
+
+    if (closestIndex != -1) {
+      final p1 = points[closestIndex];
+      final p2 = points[closestIndex + 1];
+
+      final bearingForward = distanceCalc.bearing(
+        LatLng(p1.latitude, p1.longitude),
+        LatLng(p2.latitude, p2.longitude),
+      );
+
+      double fwd = (bearingForward + 360) % 360;
+      double rev = (fwd + 180) % 360;
+
+      setState(() {
+        _selectedSegmentPoint = point;
+        _segmentLabelForward = "${fwd.toStringAsFixed(0)}°";
+        _segmentLabelReverse = "${rev.toStringAsFixed(0)}°";
+      });
+    }
+  }
+
+  void _toggleNavigationMode() {
+    setState(() {
+      if (_navMode == NavigationMode.northUp) {
+        _navMode = NavigationMode.courseUp;
+        _showSnack("Modo Proa (Livre)");
+      } else {
+        _navMode = NavigationMode.northUp;
+        _mapController.rotate(0);
+        _showSnack("Modo Norte (Fixo)");
+      }
+    });
+  }
+
+  // ============================================
+  // DIÁLOGOS E MENUS
+  // ============================================
+
+  void _showMapStyleSelector(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: kGlassPanel,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: BackdropFilter(
+            filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+            child: Padding(
+              padding: const EdgeInsets.all(20.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "ESTILO DE MAPA",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      _mapStyleOption(
+                          Icons.nightlight_round, "Tático", MapStyle.dark),
+                      _mapStyleOption(
+                          Icons.satellite_alt, "Satélite", MapStyle.satellite),
+                      _mapStyleOption(
+                          Icons.landscape, "Terreno", MapStyle.terrain),
+                      _mapStyleOption(
+                          Icons.terrain, "Topo 3D", MapStyle.topo3D),
+                      _mapStyleOption(Icons.wb_sunny, "Claro", MapStyle.light),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _mapStyleOption(IconData icon, String label, MapStyle style) {
+    bool isSelected = _currentMapStyle == style;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _currentMapStyle = style);
+        Navigator.pop(context);
+      },
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isSelected ? kTacticalGreen : Colors.white10,
+              shape: BoxShape.circle,
+              boxShadow: isSelected
+                  ? [const BoxShadow(color: kTacticalGreen, blurRadius: 10)]
+                  : [],
+            ),
+            child: Icon(
+              icon,
+              color: isSelected ? Colors.black : Colors.white,
+              size: 28,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: isSelected ? kTacticalGreen : Colors.grey,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showCalibrationDialog() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kGlassPanel,
+        title: const Row(
+          children: [
+            Icon(Icons.settings_input_antenna, color: kTacticalGreen),
+            SizedBox(width: 10),
+            Text("Calibração", style: TextStyle(color: Colors.white)),
+          ],
+        ),
+        content: const Text(
+          "Mova o dispositivo em '8' para calibrar.\nNecessário apenas uma vez por uso.",
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("OK", style: TextStyle(color: kTacticalGreen)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSnack(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? kAlertRed : kTacticalGreen,
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTES VISUAIS
+  // ============================================
+
+  Widget _buildCircleButton(
+    IconData icon,
+    VoidCallback onTap, {
+    bool active = false,
+  }) {
+    return Container(
+      width: 44,
+      height: 44,
+      decoration: BoxDecoration(
+        color: active ? kTacticalGreen : kGlassPanel,
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: active ? kTacticalGreen : Colors.white24,
+        ),
+      ),
+      child: IconButton(
+        icon: Icon(
+          icon,
+          color: active ? Colors.black : Colors.white,
+          size: 20,
+        ),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  Widget _buildMiniButton(IconData icon, VoidCallback onTap) {
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        color: kGlassPanel.withOpacity(0.6),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        icon: Icon(icon, color: Colors.white, size: 18),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  Widget _buildVignetteOverlay() {
+    return IgnorePointer(
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: RadialGradient(
+            colors: [
+              Colors.transparent,
+              Colors.black.withOpacity(0.5),
+            ],
+            radius: 1.2,
+            stops: const [0.7, 1.0],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ============================================
+  // UTILS
+  // ============================================
+
+  double _lerpHeading(double a, double b, double t) {
+    double diff = b - a;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    return a + diff * t;
+  }
+
+  double _lerpDouble(double a, double b, double t) => a + (b - a) * t;
 }
+
+// ============================================
+// 🔚 FIM DA PARTE 2/3
+// ⚠️  CONTINUE COM A PARTE 3/3 (PAINTERS)
+// ============================================
+
+// ============================================
+// 📄 map_screen.dart - PARTE 3/3 (FINAL)
+// ⚠️  COLE ESTE BLOCO APÓS A PARTE 2/3
+// ============================================
+
+// ============================================
+// CUSTOM PAINTERS
+// ============================================
+
+class TacticalCompassPainter extends CustomPainter {
+  final double heading;
+
+  TacticalCompassPainter({required this.heading});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint paint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+
+    final TextPainter tp = TextPainter(
+      textDirection: TextDirection.ltr,
+      textAlign: TextAlign.center,
+    );
+
+    double pixelPerDegree = size.width / 100;
+    double centerX = size.width / 2;
+
+    for (int i = (heading - 50).floor(); i <= (heading + 50).ceil(); i++) {
+      int deg = i % 360;
+      if (deg < 0) deg += 360;
+
+      double x = centerX + (i - heading) * pixelPerDegree;
+      double opacity =
+          (1.0 - ((x - centerX).abs() / (size.width / 2))).clamp(0.0, 1.0);
+
+      paint.color = Colors.white.withOpacity(opacity);
+
+      if (deg % 90 == 0) {
+        String label =
+            deg == 0 ? "N" : deg == 90 ? "E" : deg == 180 ? "S" : "W";
+
+        tp.text = TextSpan(
+          text: label,
+          style: TextStyle(
+            color: label == "N"
+                ? kAlertRed.withOpacity(opacity)
+                : Colors.white.withOpacity(opacity),
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+          ),
+        );
+
+        tp.layout();
+        tp.paint(canvas, Offset(x - tp.width / 2, 0));
+
+        paint.strokeWidth = 3;
+        canvas.drawLine(Offset(x, 25), Offset(x, 40), paint);
+      } else if (deg % 10 == 0) {
+        tp.text = TextSpan(
+          text: "${deg ~/ 10}",
+          style: TextStyle(
+            color: Colors.white.withOpacity(opacity),
+            fontSize: 12,
+          ),
+        );
+
+        tp.layout();
+        tp.paint(canvas, Offset(x - tp.width / 2, 8));
+
+        paint.strokeWidth = 1.5;
+        canvas.drawLine(Offset(x, 30), Offset(x, 40), paint);
+      } else if (deg % 5 == 0) {
+        paint.strokeWidth = 1;
+        canvas.drawLine(Offset(x, 35), Offset(x, 40), paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant TacticalCompassPainter oldDelegate) =>
+      (oldDelegate.heading - heading).abs() > 0.1;
+}
+
+class TriangleClipper extends CustomClipper<ui.Path> {
+  @override
+  ui.Path getClip(Size size) {
+    final path = ui.Path();
+    path.moveTo(0, 0);
+    path.lineTo(size.width, 0);
+    path.lineTo(size.width / 2, size.height);
+    path.close();
+    return path;
+  }
+
+  @override
+  bool shouldReclip(TriangleClipper oldClipper) => false;
+}
+
+// ============================================
+// 🎉 FIM DO ARQUIVO map_screen.dart
+// ============================================
