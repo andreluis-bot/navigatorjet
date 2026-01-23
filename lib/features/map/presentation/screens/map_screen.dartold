@@ -1,5 +1,5 @@
 // ============================================
-// 📄 map_screen.dart - PARTE 1/3 (REFATORADO)
+// 📄 map_screen.dart - PARTE 1/3
 // ⚠️  COLE ESTE BLOCO NO INÍCIO DO ARQUIVO
 // ============================================
 
@@ -14,9 +14,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:go_router/go_router.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:logger/logger.dart';
 
+import '../../../../core/config/app_config.dart';
 import '../../../../data/models/route.dart' as app_route;
 import '../../../../data/services/compass_service.dart';
 import '../../../../data/services/gps_service.dart';
@@ -33,7 +35,7 @@ const Color kAlertRed = Color(0xFFFF2B2B);
 const Color kAlertOrange = Color(0xFFFF9100);
 const Color kGlassPanel = Color(0xCC111111);
 
-enum MapStyle { dark, satellite, light, terrain }
+enum MapStyle { dark, satellite, light, terrain, topo3D }
 enum NavigationMode { northUp, courseUp }
 
 // ============================================
@@ -78,120 +80,41 @@ class _MapScreenState extends ConsumerState<MapScreen>
   double _smoothSpeed = 0.0;
   MapStyle _currentMapStyle = MapStyle.dark;
   NavigationMode _navMode = NavigationMode.courseUp;
+  bool _hasCalibrated = false;
 
   // Múltiplas rotas GPX
   List<LoadedGPXRoute> _loadedRoutes = [];
-  String? _activeRouteId;
-
-  // Gravação de rota
-  bool _isRecording = false;
-  List<LatLng> _recordedPoints = [];
-  DateTime? _recordingStartTime;
-
-  // Marcadores de perigo
-  List<LatLng> _dangerMarkers = [];
+  String? _activeRouteId; // ID da rota sendo navegada
 
   // Estado para etiqueta de segmento GPX
   LatLng? _selectedSegmentPoint;
   String? _segmentLabelForward;
   String? _segmentLabelReverse;
 
-  // Timer para gravação
-  Timer? _recordingTimer;
-
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _initializeSensorsAggressively();
+      _checkPermissionsAndStartSensors();
     });
   }
 
-  @override
-  void dispose() {
-    _recordingTimer?.cancel();
-    super.dispose();
-  }
+  Future<void> _checkPermissionsAndStartSensors() async {
+    ref.read(currentHeadingProvider);
+    ref.read(currentPositionProvider);
 
-  // ============================================
-  // INICIALIZAÇÃO AGRESSIVA DOS SENSORES
-  // ============================================
-
-  Future<void> _initializeSensorsAggressively() async {
-    _logger.i("🚀 Iniciando sensores de forma agressiva...");
-
-    // FORÇA inicialização imediata dos providers
-    try {
-      ref.read(currentHeadingProvider.notifier);
-      ref.read(currentPositionProvider.notifier);
-      _logger.i("✅ Providers instanciados");
-    } catch (e) {
-      _logger.e("❌ Erro ao instanciar providers: $e");
-    }
-
-    // Solicita permissões
     LocationPermission permission = await Geolocator.checkPermission();
-
     if (permission == LocationPermission.denied) {
-      _logger.w("⚠️ Permissão negada, solicitando...");
       permission = await Geolocator.requestPermission();
     }
 
-    if (permission == LocationPermission.deniedForever) {
-      if (mounted) {
-        _showSnack("Permissão de GPS negada permanentemente", isError: true);
-      }
-      return;
-    }
-
-    // FORÇA uma leitura inicial do GPS
     if (permission == LocationPermission.whileInUse ||
         permission == LocationPermission.always) {
-      _logger.i("🎯 Acordando GPS com leitura forçada...");
-
-      try {
-        final position = await Geolocator.getCurrentPosition(
-          desiredAccuracy: LocationAccuracy.high,
-          timeLimit: const Duration(seconds: 10),
-        ).timeout(
-          const Duration(seconds: 10),
-          onTimeout: () {
-            _logger.w("⏱️ Timeout na leitura inicial do GPS");
-            throw TimeoutException("GPS timeout");
-          },
-        );
-
-        _logger.i("✅ GPS ATIVO: ${position.latitude}, ${position.longitude}");
-
-        // Centraliza mapa na posição atual
-        if (mounted) {
-          _mapController.move(
-            LatLng(position.latitude, position.longitude),
-            16,
-          );
-        }
-      } catch (e) {
-        _logger.e("❌ Erro ao acordar GPS: $e");
-        if (mounted) {
-          _showSnack("GPS demorou a responder, continuando...", isError: false);
-        }
-      }
+      Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high)
+          .then((_) {})
+          .catchError((e) {});
     }
-
-    // FORÇA leitura da bússola
-    try {
-      final heading = ref.read(currentHeadingProvider).value;
-      _logger.i("✅ Bússola ATIVA: ${heading ?? 'aguardando'}°");
-    } catch (e) {
-      _logger.e("❌ Erro na bússola: $e");
-    }
-
-    _logger.i("🎉 Sensores inicializados!");
   }
-
-  // ============================================
-  // BUILD PRINCIPAL
-  // ============================================
 
   @override
   Widget build(BuildContext context) {
@@ -208,11 +131,6 @@ class _MapScreenState extends ConsumerState<MapScreen>
     final LatLng currentPos = gpsAsync.value != null
         ? LatLng(gpsAsync.value!.latitude, gpsAsync.value!.longitude)
         : const LatLng(-23.5505, -46.6333);
-
-    // Gravação automática de pontos
-    if (_isRecording && gpsAsync.value != null) {
-      _recordPoint(currentPos);
-    }
 
     final double mapRotation =
         _navMode == NavigationMode.courseUp ? -_smoothHeading : 0.0;
@@ -246,8 +164,8 @@ class _MapScreenState extends ConsumerState<MapScreen>
             right: 16,
             child: SafeArea(
               top: false,
-              child: _buildTacticalDashboard(
-                  _smoothSpeed, navigationState, gpsAsync),
+              child:
+                  _buildTacticalDashboard(_smoothSpeed, navigationState, gpsAsync),
             ),
           ),
 
@@ -255,38 +173,67 @@ class _MapScreenState extends ConsumerState<MapScreen>
           Positioned(
             left: 16,
             top: MediaQuery.of(context).padding.top + 130,
-            child: _buildLeftControls(),
+            child: Column(
+              children: [
+                _buildCircleButton(Icons.layers,
+                    () => _showMapStyleSelector(context)),
+                const SizedBox(height: 12),
+                _buildCircleButton(Icons.folder_open, _handleGpxImport),
+                const SizedBox(height: 12),
+                _buildCircleButton(
+                    Icons.route, () => _showRoutesManager(context)),
+                const SizedBox(height: 12),
+                _buildCircleButton(
+                    Icons.settings_input_antenna, _showCalibrationDialog),
+              ],
+            ),
           ),
 
           // 6. CONTROLES LATERAIS DIREITOS
           Positioned(
             right: 16,
             bottom: 180,
-            child: _buildRightControls(currentPos),
+            child: Column(
+              children: [
+                _buildMiniButton(Icons.add, () {
+                  final currZoom = _mapController.camera.zoom;
+                  _mapController.move(
+                      _mapController.camera.center, currZoom + 1);
+                }),
+                const SizedBox(height: 8),
+                _buildMiniButton(Icons.remove, () {
+                  final currZoom = _mapController.camera.zoom;
+                  _mapController.move(
+                      _mapController.camera.center, currZoom - 1);
+                }),
+                const SizedBox(height: 20),
+                _buildCircleButton(Icons.my_location, () {
+                  ref.refresh(currentPositionProvider);
+                  _mapController.move(currentPos, 16);
+                }),
+                const SizedBox(height: 12),
+                _buildCircleButton(
+                  _navMode == NavigationMode.northUp
+                      ? Icons.explore
+                      : Icons.navigation,
+                  _toggleNavigationMode,
+                  active: _navMode == NavigationMode.courseUp,
+                ),
+              ],
+            ),
           ),
 
           // 7. STATUS SUPERIORES
           Positioned(
             top: MediaQuery.of(context).padding.top + 10,
             left: 16,
-            child: _buildGpsStatus(gpsAsync),
+            child: _buildDjiGpsStatus(gpsAsync),
           ),
-
-          // 8. MENU HAMBURGER (canto superior direito)
           Positioned(
             top: MediaQuery.of(context).padding.top + 10,
             right: 16,
-            child: _buildHamburgerMenu(),
+            child: _buildDirectionStatus(_smoothHeading),
           ),
-
-          // 9. INDICADOR DE GRAVAÇÃO (se ativa)
-          if (_isRecording)
-            Positioned(
-              top: MediaQuery.of(context).padding.top + 60,
-              left: 0,
-              right: 0,
-              child: _buildRecordingIndicator(),
-            ),
         ],
       ),
     );
@@ -310,6 +257,11 @@ class _MapScreenState extends ConsumerState<MapScreen>
       case MapStyle.terrain:
         urlTemplate = 'https://mt0.google.com/vt/lyrs=p&x={x}&y={y}&z={z}';
         break;
+      case MapStyle.topo3D:
+        // Mapa Topográfico 3D (Thunderforest Outdoors - Gratuito até 150k tiles/mês)
+        urlTemplate =
+            'https://tile.thunderforest.com/outdoors/{z}/{x}/{y}.png?apikey=390a046832534c7c9d2e44227a9fcd92';
+        break;
       case MapStyle.light:
         urlTemplate =
             'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
@@ -329,12 +281,6 @@ class _MapScreenState extends ConsumerState<MapScreen>
         initialRotation: rotation,
         backgroundColor: Colors.black,
         onTap: (tapPos, point) => _handleMapTap(point),
-        onMapEvent: (MapEvent event) {
-          // No modo NorthUp, impede rotação manual
-          if (_navMode == NavigationMode.northUp && event is MapEventRotate) {
-            Future.microtask(() => _mapController.rotate(0.0));
-          }
-        },
         interactionOptions: InteractionOptions(
           flags: _navMode == NavigationMode.courseUp
               ? InteractiveFlag.all & ~InteractiveFlag.rotate
@@ -344,27 +290,15 @@ class _MapScreenState extends ConsumerState<MapScreen>
       children: [
         TileLayer(
           urlTemplate: urlTemplate,
-          subdomains: _currentMapStyle == MapStyle.terrain
+          subdomains: _currentMapStyle == MapStyle.terrain ||
+                  _currentMapStyle == MapStyle.topo3D
               ? const []
               : const ['a', 'b', 'c', 'd'],
           userAgentPackageName: 'com.navigatorjet.app',
           retinaMode: true,
         ),
 
-        // Rota sendo gravada (azul claro)
-        if (_recordedPoints.isNotEmpty)
-          PolylineLayer(
-            polylines: [
-              Polyline(
-                points: _recordedPoints,
-                strokeWidth: 4.0,
-                color: Colors.lightBlueAccent,
-                pattern: const StrokePattern.solid(),
-              ),
-            ],
-          ),
-
-        // Rotas GPX carregadas (múltiplas, cores personalizadas)
+        // TODAS as rotas carregadas (visíveis)
         ..._loadedRoutes
             .where((r) => r.isVisible)
             .map((loadedRoute) => PolylineLayer(
@@ -381,23 +315,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 ))
             .toList(),
 
-        // Marcadores de perigo
-        MarkerLayer(
-          markers: _dangerMarkers
-              .map((point) => Marker(
-                    point: point,
-                    width: 40,
-                    height: 40,
-                    child: const Icon(
-                      Icons.warning,
-                      color: kAlertRed,
-                      size: 30,
-                    ),
-                  ))
-              .toList(),
-        ),
-
-        // Etiqueta de segmento
+        // Marcador de Segmento (Etiqueta)
         if (_selectedSegmentPoint != null)
           MarkerLayer(
             markers: [
@@ -481,7 +399,11 @@ class _MapScreenState extends ConsumerState<MapScreen>
         ),
         ClipPath(
           clipper: TriangleClipper(),
-          child: Container(width: 12, height: 8, color: kTacticalGreen),
+          child: Container(
+            width: 12,
+            height: 8,
+            color: kTacticalGreen,
+          ),
         ),
       ],
     );
@@ -529,7 +451,10 @@ class _MapScreenState extends ConsumerState<MapScreen>
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [Colors.black.withOpacity(0.9), Colors.transparent],
+          colors: [
+            Colors.black.withOpacity(0.9),
+            Colors.transparent,
+          ],
         ),
       ),
       child: Column(
@@ -562,16 +487,9 @@ class _MapScreenState extends ConsumerState<MapScreen>
     );
   }
 
-// ============================================
-// 🔚 FIM DA PARTE 1/3
-// ⚠️  CONTINUE COM A PARTE 2/3
-// ============================================
-// ============================================
-// 📄 map_screen.dart - PARTE 2/3 (REFATORADO)
-// ⚠️  COLE ESTE BLOCO APÓS A PARTE 1/3
-// ============================================
-
-  // COMPONENTES DE DASHBOARD E STATUS (continuação)
+  // ============================================
+  // COMPONENTE: DASHBOARD
+  // ============================================
 
   Widget _buildTacticalDashboard(
     double speed,
@@ -619,6 +537,7 @@ class _MapScreenState extends ConsumerState<MapScreen>
                   ),
                 ],
               ),
+
               Container(width: 1, height: 40, color: Colors.white12),
 
               // RUMO & DIST
@@ -640,15 +559,40 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 ],
               ),
 
-              // TEMPO NA ROTA
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  _buildInfoRow("TEMPO", _getElapsedTime()),
-                  const SizedBox(height: 4),
-                  _buildInfoRow("PONTOS", "${_recordedPoints.length}"),
-                ],
+              // VOLTA (Inverter rota ativa)
+              InkWell(
+                onTap: () {
+                  if (_activeRouteId != null) {
+                    ref
+                        .read(navigationEngineProvider.notifier)
+                        .toggleRouteDirection();
+                    _showSnack("Rota Invertida");
+                    setState(() {});
+                  }
+                },
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: kAlertRed.withOpacity(0.2),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: kAlertRed),
+                  ),
+                  child: const Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.swap_vert, color: kAlertRed, size: 20),
+                      Text(
+                        "VOLTA",
+                        style: TextStyle(
+                          color: kAlertRed,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ],
           ),
@@ -660,7 +604,10 @@ class _MapScreenState extends ConsumerState<MapScreen>
   Widget _buildInfoRow(String label, String value) {
     return Row(
       children: [
-        Text("$label ", style: const TextStyle(color: Colors.grey, fontSize: 10)),
+        Text(
+          "$label ",
+          style: const TextStyle(color: Colors.grey, fontSize: 10),
+        ),
         Text(
           value,
           style: const TextStyle(
@@ -673,15 +620,18 @@ class _MapScreenState extends ConsumerState<MapScreen>
     );
   }
 
-  String _getElapsedTime() {
-    if (_recordingStartTime == null) return "--";
-    final elapsed = DateTime.now().difference(_recordingStartTime!);
-    final hours = elapsed.inHours;
-    final minutes = elapsed.inMinutes % 60;
-    return "${hours}h${minutes}m";
-  }
+// ============================================
+// 🔚 FIM DA PARTE 1/3
+// ⚠️  CONTINUE COM A PARTE 2/3
+// ============================================
+// ============================================
+// 📄 map_screen.dart - PARTE 2/3
+// ⚠️  COLE ESTE BLOCO APÓS A PARTE 1/3
+// ============================================
 
-  Widget _buildGpsStatus(AsyncValue gpsAsync) {
+  // COMPONENTES DE STATUS (continuação da classe _MapScreenState)
+
+  Widget _buildDjiGpsStatus(AsyncValue gpsAsync) {
     double accuracy = 999;
     if (gpsAsync.hasValue && gpsAsync.value != null) {
       accuracy = gpsAsync.value!.accuracy;
@@ -731,7 +681,9 @@ class _MapScreenState extends ConsumerState<MapScreen>
                 width: 3,
                 height: 6.0 + (index * 3),
                 margin: const EdgeInsets.only(right: 2),
-                color: index < bars ? signalColor : Colors.grey.withOpacity(0.3),
+                color: index < bars
+                    ? signalColor
+                    : Colors.grey.withOpacity(0.3),
               ),
             ),
           ),
@@ -739,13 +691,18 @@ class _MapScreenState extends ConsumerState<MapScreen>
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(label,
-                  style: TextStyle(
-                      color: signalColor,
-                      fontSize: 10,
-                      fontWeight: FontWeight.w900)),
-              Text("±${accuracy.toStringAsFixed(0)}m",
-                  style: const TextStyle(color: Colors.white, fontSize: 9)),
+              Text(
+                label,
+                style: TextStyle(
+                  color: signalColor,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+              Text(
+                "±${accuracy.toStringAsFixed(0)}m",
+                style: const TextStyle(color: Colors.white, fontSize: 9),
+              ),
             ],
           ),
         ],
@@ -753,99 +710,27 @@ class _MapScreenState extends ConsumerState<MapScreen>
     );
   }
 
-  Widget _buildHamburgerMenu() {
+  Widget _buildDirectionStatus(double heading) {
     return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
       decoration: BoxDecoration(
         color: Colors.black.withOpacity(0.8),
         borderRadius: BorderRadius.circular(6),
         border: Border.all(color: Colors.white24),
       ),
-      child: IconButton(
-        icon: const Icon(Icons.menu, color: Colors.white, size: 20),
-        onPressed: () => _showSettingsMenu(context),
-      ),
-    );
-  }
-
-  Widget _buildRecordingIndicator() {
-    return Center(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-        decoration: BoxDecoration(
-          color: kAlertRed,
-          borderRadius: BorderRadius.circular(20),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.fiber_manual_record, color: Colors.white, size: 16),
-            const SizedBox(width: 8),
-            Text(
-              "GRAVANDO ${_getElapsedTime()}",
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
+      child: Text(
+        "${heading.toStringAsFixed(0)}°",
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 12,
+          fontWeight: FontWeight.bold,
         ),
       ),
     );
   }
 
   // ============================================
-  // CONTROLES LATERAIS
-  // ============================================
-
-  Widget _buildLeftControls() {
-    return Column(
-      children: [
-        _buildCircleButton(Icons.layers, () => _showMapStyleSelector(context)),
-        const SizedBox(height: 12),
-        _buildCircleButton(Icons.folder_open, _handleGpxImport),
-        const SizedBox(height: 12),
-        _buildCircleButton(Icons.route, () => _showRoutesManager(context)),
-        const SizedBox(height: 12),
-        _buildCircleButton(
-          Icons.fiber_manual_record,
-          _toggleRecording,
-          active: _isRecording,
-        ),
-        const SizedBox(height: 12),
-        _buildCircleButton(Icons.warning, _addDangerMarker),
-      ],
-    );
-  }
-
-  Widget _buildRightControls(LatLng currentPos) {
-    return Column(
-      children: [
-        _buildMiniButton(Icons.add, () {
-          final currZoom = _mapController.camera.zoom;
-          _mapController.move(_mapController.camera.center, currZoom + 1);
-        }),
-        const SizedBox(height: 8),
-        _buildMiniButton(Icons.remove, () {
-          final currZoom = _mapController.camera.zoom;
-          _mapController.move(_mapController.camera.center, currZoom - 1);
-        }),
-        const SizedBox(height: 20),
-        _buildCircleButton(Icons.my_location, () {
-          ref.refresh(currentPositionProvider);
-          _mapController.move(currentPos, 16);
-        }),
-        const SizedBox(height: 12),
-        _buildCircleButton(
-          _navMode == NavigationMode.northUp ? Icons.explore : Icons.navigation,
-          _toggleNavigationMode,
-          active: _navMode == NavigationMode.courseUp,
-        ),
-      ],
-    );
-  }
-
-  // ============================================
-  // GERENCIADOR DE ROTAS
+  // GERENCIADOR DE ROTAS MÚLTIPLAS
   // ============================================
 
   void _showRoutesManager(BuildContext context) {
@@ -918,98 +803,82 @@ class _MapScreenState extends ConsumerState<MapScreen>
                                     ),
                                   ),
                                   child: ListTile(
-                                    leading: Icon(Icons.route,
-                                        color: route.color, size: 28),
+                                    leading: Icon(
+                                      Icons.route,
+                                      color: route.color,
+                                    ),
                                     title: Text(
                                       route.name,
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                      overflow: TextOverflow.ellipsis,
-                                      maxLines: 1,
+                                      style:
+                                          const TextStyle(color: Colors.white),
                                     ),
                                     subtitle: Text(
                                       "${route.route.points.length} pontos",
-                                      style: const TextStyle(
-                                          color: Colors.grey, fontSize: 12),
+                                      style:
+                                          const TextStyle(color: Colors.grey),
                                     ),
-                                    trailing: SizedBox(
-                                      width: 180,
-                                      child: Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          IconButton(
-                                            icon: Icon(Icons.palette,
-                                                color: route.color, size: 20),
-                                            onPressed: () {
-                                              _showColorPicker(
-                                                  context, route, setModalState);
-                                            },
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(),
+                                    trailing: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        // Trocar cor
+                                        IconButton(
+                                          icon: Icon(Icons.palette,
+                                              color: route.color),
+                                          onPressed: () {
+                                            _showColorPicker(
+                                                context, route, setModalState);
+                                          },
+                                        ),
+                                        // Visibilidade
+                                        IconButton(
+                                          icon: Icon(
+                                            route.isVisible
+                                                ? Icons.visibility
+                                                : Icons.visibility_off,
+                                            color: Colors.white,
                                           ),
-                                          const SizedBox(width: 4),
-                                          IconButton(
-                                            icon: Icon(
-                                              route.isVisible
-                                                  ? Icons.visibility
-                                                  : Icons.visibility_off,
-                                              color: Colors.white,
-                                              size: 20,
-                                            ),
-                                            onPressed: () {
-                                              setModalState(() {
-                                                route.isVisible =
-                                                    !route.isVisible;
-                                              });
-                                              setState(() {});
-                                            },
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(),
+                                          onPressed: () {
+                                            setModalState(() {
+                                              route.isVisible =
+                                                  !route.isVisible;
+                                            });
+                                            setState(() {});
+                                          },
+                                        ),
+                                        // Navegar
+                                        IconButton(
+                                          icon: Icon(
+                                            Icons.navigation,
+                                            color: isActive
+                                                ? kTacticalGreen
+                                                : Colors.white,
                                           ),
-                                          const SizedBox(width: 4),
-                                          IconButton(
-                                            icon: Icon(
-                                              Icons.navigation,
-                                              color: isActive
-                                                  ? kTacticalGreen
-                                                  : Colors.white,
-                                              size: 20,
-                                            ),
-                                            onPressed: () {
-                                              _activateRoute(route.id);
-                                              setModalState(() {});
-                                              setState(() {});
-                                            },
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(),
-                                          ),
-                                          const SizedBox(width: 4),
-                                          IconButton(
-                                            icon: const Icon(Icons.delete,
-                                                color: kAlertRed, size: 20),
-                                            onPressed: () {
-                                              setModalState(() {
-                                                _loadedRoutes.remove(route);
-                                                if (_activeRouteId ==
-                                                    route.id) {
-                                                  _activeRouteId = null;
-                                                  ref
-                                                      .read(
-                                                          navigationEngineProvider
-                                                              .notifier)
-                                                      .stopNavigation();
-                                                }
-                                              });
-                                              setState(() {});
-                                            },
-                                            padding: EdgeInsets.zero,
-                                            constraints: const BoxConstraints(),
-                                          ),
-                                        ],
-                                      ),
+                                          onPressed: () {
+                                            _activateRoute(route.id);
+                                            setModalState(() {});
+                                            setState(() {});
+                                          },
+                                        ),
+                                        // Deletar
+                                        IconButton(
+                                          icon: const Icon(Icons.delete,
+                                              color: kAlertRed),
+                                          onPressed: () {
+                                            setModalState(() {
+                                              _loadedRoutes.remove(route);
+                                              if (_activeRouteId == route.id) {
+                                                _activeRouteId = null;
+                                                ref
+                                                    .read(
+                                                        navigationEngineProvider
+                                                            .notifier)
+                                                    .stopNavigation();
+                                              }
+                                            });
+                                            setState(() {});
+                                          },
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 );
@@ -1098,7 +967,440 @@ class _MapScreenState extends ConsumerState<MapScreen>
     _showSnack("Navegando: ${route.name}");
   }
 
+  // ============================================
+  // LÓGICA: IMPORTAÇÃO GPX
+  // ============================================
+
+  Future<void> _handleGpxImport() async {
+    try {
+      FilePickerResult? result = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        allowMultiple: false,
+      );
+
+      if (result != null) {
+        final File file = File(result.files.single.path!);
+        final app_route.Route? route = await _gpxParser.parseGPXFile(file);
+
+        if (route != null) {
+          // Gera ID único e cor aleatória
+          final id = DateTime.now().millisecondsSinceEpoch.toString();
+          final colors = [
+            Colors.orange,
+            Colors.blue,
+            Colors.red,
+            Colors.green,
+            Colors.purple,
+            Colors.cyan,
+          ];
+          final randomColor = colors[math.Random().nextInt(colors.length)];
+
+          final loadedRoute = LoadedGPXRoute(
+            id: id,
+            name: route.name.isEmpty
+                ? "Rota ${_loadedRoutes.length + 1}"
+                : route.name,
+            route: route,
+            color: randomColor,
+          );
+
+          setState(() {
+            _loadedRoutes.add(loadedRoute);
+          });
+
+          _showSnack("Rota carregada: ${loadedRoute.name}");
+        }
+      }
+    } catch (e) {
+      _logger.e("GPX Error: $e");
+      _showSnack("Erro ao importar GPX", isError: true);
+    }
+  }
+
+  // ============================================
+  // LÓGICA: MAPA E NAVEGAÇÃO
+  // ============================================
+
+  void _handleMapTap(LatLng point) {
+    // Encontra a rota ATIVA para mostrar etiquetas
+    if (_activeRouteId == null) return;
+
+    final activeRoute =
+        _loadedRoutes.firstWhere((r) => r.id == _activeRouteId);
+
+    setState(() {
+      _selectedSegmentPoint = null;
+      _segmentLabelForward = null;
+      _segmentLabelReverse = null;
+    });
+
+    double minDistance = double.infinity;
+    int closestIndex = -1;
+    const Distance distanceCalc = Distance();
+
+    final points = activeRoute.route.points;
+    for (int i = 0; i < points.length - 1; i++) {
+      final p1 = LatLng(points[i].latitude, points[i].longitude);
+      final p2 = LatLng(points[i + 1].latitude, points[i + 1].longitude);
+
+      final center = LatLng(
+        (p1.latitude + p2.latitude) / 2,
+        (p1.longitude + p2.longitude) / 2,
+      );
+
+      final dist = distanceCalc.as(LengthUnit.Meter, point, center);
+
+      if (dist < 500 && dist < minDistance) {
+        minDistance = dist;
+        closestIndex = i;
+      }
+    }
+
+    if (closestIndex != -1) {
+      final p1 = points[closestIndex];
+      final p2 = points[closestIndex + 1];
+
+      final bearingForward = distanceCalc.bearing(
+        LatLng(p1.latitude, p1.longitude),
+        LatLng(p2.latitude, p2.longitude),
+      );
+
+      double fwd = (bearingForward + 360) % 360;
+      double rev = (fwd + 180) % 360;
+
+      setState(() {
+        _selectedSegmentPoint = point;
+        _segmentLabelForward = "${fwd.toStringAsFixed(0)}°";
+        _segmentLabelReverse = "${rev.toStringAsFixed(0)}°";
+      });
+    }
+  }
+
+  void _toggleNavigationMode() {
+    setState(() {
+      if (_navMode == NavigationMode.northUp) {
+        _navMode = NavigationMode.courseUp;
+        _showSnack("Modo Proa (Livre)");
+      } else {
+        _navMode = NavigationMode.northUp;
+        _mapController.rotate(0);
+        _showSnack("Modo Norte (Fixo)");
+      }
+    });
+  }
+
+  // ============================================
+  // DIÁLOGOS E MENUS
+  // ============================================
+
+  void _showMapStyleSelector(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: kGlassPanel,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+          ),
+          child: BackdropFilter(
+            filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+            child: Padding(
+              padding: const EdgeInsets.all(20.0),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "ESTILO DE MAPA",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      _mapStyleOption(
+                          Icons.nightlight_round, "Tático", MapStyle.dark),
+                      _mapStyleOption(
+                          Icons.satellite_alt, "Satélite", MapStyle.satellite),
+                      _mapStyleOption(
+                          Icons.landscape, "Terreno", MapStyle.terrain),
+                      _mapStyleOption(
+                          Icons.terrain, "Topo 3D", MapStyle.topo3D),
+                      _mapStyleOption(Icons.wb_sunny, "Claro", MapStyle.light),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _mapStyleOption(IconData icon, String label, MapStyle style) {
+    bool isSelected = _currentMapStyle == style;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _currentMapStyle = style);
+        Navigator.pop(context);
+      },
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isSelected ? kTacticalGreen : Colors.white10,
+              shape: BoxShape.circle,
+              boxShadow: isSelected
+                  ? [const BoxShadow(color: kTacticalGreen, blurRadius: 10)]
+                  : [],
+            ),
+            child: Icon(
+              icon,
+              color: isSelected ? Colors.black : Colors.white,
+              size: 28,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: TextStyle(
+              color: isSelected ? kTacticalGreen : Colors.grey,
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showCalibrationDialog() {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kGlassPanel,
+        title: const Row(
+          children: [
+            Icon(Icons.settings_input_antenna, color: kTacticalGreen),
+            SizedBox(width: 10),
+            Text("Calibração", style: TextStyle(color: Colors.white)),
+          ],
+        ),
+        content: const Text(
+          "Mova o dispositivo em '8' para calibrar.\nNecessário apenas uma vez por uso.",
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text("OK", style: TextStyle(color: kTacticalGreen)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSnack(String msg, {bool isError = false}) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: isError ? kAlertRed : kTacticalGreen,
+        duration: const Duration(seconds: 1),
+      ),
+    );
+  }
+
+  // ============================================
+  // COMPONENTES VISUAIS
+  // ============================================
+
+  Widget _buildCircleButton(
+    IconData icon,
+    VoidCallback onTap, {
+    bool active = false,
+  }) {
+    return Container(
+      width: 44,
+      height: 44,
+      decoration: BoxDecoration(
+        color: active ? kTacticalGreen : kGlassPanel,
+        shape: BoxShape.circle,
+        border: Border.all(
+          color: active ? kTacticalGreen : Colors.white24,
+        ),
+      ),
+      child: IconButton(
+        icon: Icon(
+          icon,
+          color: active ? Colors.black : Colors.white,
+          size: 20,
+        ),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  Widget _buildMiniButton(IconData icon, VoidCallback onTap) {
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        color: kGlassPanel.withOpacity(0.6),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: IconButton(
+        padding: EdgeInsets.zero,
+        icon: Icon(icon, color: Colors.white, size: 18),
+        onPressed: onTap,
+      ),
+    );
+  }
+
+  Widget _buildVignetteOverlay() {
+    return IgnorePointer(
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: RadialGradient(
+            colors: [
+              Colors.transparent,
+              Colors.black.withOpacity(0.5),
+            ],
+            radius: 1.2,
+            stops: const [0.7, 1.0],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ============================================
+  // UTILS
+  // ============================================
+
+  double _lerpHeading(double a, double b, double t) {
+    double diff = b - a;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    return a + diff * t;
+  }
+
+  double _lerpDouble(double a, double b, double t) => a + (b - a) * t;
+}
+
 // ============================================
 // 🔚 FIM DA PARTE 2/3
-// ⚠️  CONTINUE COM A PARTE 3/3 (FINAL)
+// ⚠️  CONTINUE COM A PARTE 3/3 (PAINTERS)
+// ============================================
+
+// ============================================
+// 📄 map_screen.dart - PARTE 3/3 (FINAL)
+// ⚠️  COLE ESTE BLOCO APÓS A PARTE 2/3
+// ============================================
+
+// ============================================
+// CUSTOM PAINTERS
+// ============================================
+
+class TacticalCompassPainter extends CustomPainter {
+  final double heading;
+
+  TacticalCompassPainter({required this.heading});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint paint = Paint()
+      ..color = Colors.white
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+
+    final TextPainter tp = TextPainter(
+      textDirection: TextDirection.ltr,
+      textAlign: TextAlign.center,
+    );
+
+    double pixelPerDegree = size.width / 100;
+    double centerX = size.width / 2;
+
+    for (int i = (heading - 50).floor(); i <= (heading + 50).ceil(); i++) {
+      int deg = i % 360;
+      if (deg < 0) deg += 360;
+
+      double x = centerX + (i - heading) * pixelPerDegree;
+      double opacity =
+          (1.0 - ((x - centerX).abs() / (size.width / 2))).clamp(0.0, 1.0);
+
+      paint.color = Colors.white.withOpacity(opacity);
+
+      if (deg % 90 == 0) {
+        String label =
+            deg == 0 ? "N" : deg == 90 ? "E" : deg == 180 ? "S" : "W";
+
+        tp.text = TextSpan(
+          text: label,
+          style: TextStyle(
+            color: label == "N"
+                ? kAlertRed.withOpacity(opacity)
+                : Colors.white.withOpacity(opacity),
+            fontSize: 20,
+            fontWeight: FontWeight.bold,
+          ),
+        );
+
+        tp.layout();
+        tp.paint(canvas, Offset(x - tp.width / 2, 0));
+
+        paint.strokeWidth = 3;
+        canvas.drawLine(Offset(x, 25), Offset(x, 40), paint);
+      } else if (deg % 10 == 0) {
+        tp.text = TextSpan(
+          text: "${deg ~/ 10}",
+          style: TextStyle(
+            color: Colors.white.withOpacity(opacity),
+            fontSize: 12,
+          ),
+        );
+
+        tp.layout();
+        tp.paint(canvas, Offset(x - tp.width / 2, 8));
+
+        paint.strokeWidth = 1.5;
+        canvas.drawLine(Offset(x, 30), Offset(x, 40), paint);
+      } else if (deg % 5 == 0) {
+        paint.strokeWidth = 1;
+        canvas.drawLine(Offset(x, 35), Offset(x, 40), paint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant TacticalCompassPainter oldDelegate) =>
+      (oldDelegate.heading - heading).abs() > 0.1;
+}
+
+class TriangleClipper extends CustomClipper<ui.Path> {
+  @override
+  ui.Path getClip(Size size) {
+    final path = ui.Path();
+    path.moveTo(0, 0);
+    path.lineTo(size.width, 0);
+    path.lineTo(size.width / 2, size.height);
+    path.close();
+    return path;
+  }
+
+  @override
+  bool shouldReclip(TriangleClipper oldClipper) => false;
+}
+
+// ============================================
+// 🎉 FIM DO ARQUIVO map_screen.dart
 // ============================================
